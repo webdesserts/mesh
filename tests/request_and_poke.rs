@@ -838,3 +838,79 @@ async fn two_node_pairing_populates_both_allowlists_with_real_names() -> anyhow:
     assert_eq!(pokes.pokes[0].from_device.as_deref(), Some("umbra"));
     Ok(())
 }
+
+#[tokio::test]
+async fn pair_returns_conflict_when_persist_fails() -> anyhow::Result<()> {
+    // Peri #m560 item 2: a persist failure must fail loudly, not answer 200
+    // `success: true` for a peer that never reached the allowlist.
+    let tag = std::process::id();
+    let umbra_dir = std::env::temp_dir().join(format!("wd-mesh-pf-umbra-{tag}"));
+    let rhea_dir = std::env::temp_dir().join(format!("wd-mesh-pf-rhea-{tag}"));
+    let _ = std::fs::remove_dir_all(&umbra_dir);
+    let _ = std::fs::remove_dir_all(&rhea_dir);
+
+    let umbra = Arc::new(MeshDaemon::start(MeshPaths::at(&umbra_dir), MeshConfig::new("umbra")).await?);
+    let rhea = Arc::new(MeshDaemon::start(MeshPaths::at(&rhea_dir), MeshConfig::new("rhea")).await?);
+    seed_lookup(rhea.node.as_ref(), umbra.node.as_ref())?;
+
+    // A regular file where the allowlist'"'"'s parent directory should be makes
+    // `save_peers` fail with an Io error (create_dir_all -> ENOTDIR).
+    let blocker = std::env::temp_dir().join(format!("wd-mesh-pf-blocker-{tag}"));
+    std::fs::write(&blocker, b"not a directory")?;
+    let blocked = FileAllowlistStorage::at_path(blocker.join("allowlist.json"));
+
+    let rhea_state = Arc::new(webdesserts_mesh::api::ApiState {
+        node: rhea.node.clone(),
+        allowlist: Arc::new(blocked),
+        apps: rhea.apps.clone(),
+        inbox: rhea.inbox.clone(),
+        gossip: rhea.gossip.clone(),
+        pool: rhea.pool.clone(),
+        device_name: rhea.device_name.clone(),
+        self_id: rhea.self_id,
+        relays: rhea.relays.clone(),
+        pending_pairing: rhea.pending_pairing.clone(),
+        notes_health_url: rhea.notes_health_url.clone(),
+        relay_listen: rhea.relay_listen,
+    });
+
+    let umbra_port = spawn_api(umbra.api_state()).await?;
+    let rhea_port = spawn_api(rhea_state).await?;
+    let client = reqwest::Client::new();
+
+    let armed: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{umbra_port}/pair/code"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let code = armed["code"].as_str().expect("armed code").to_string();
+
+    let resp = client
+        .post(format!("http://127.0.0.1:{rhea_port}/pair"))
+        .json(&serde_json::json!({
+            "peer": umbra.node.node_id().to_string(),
+            "code": code,
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status().as_u16(),
+        409,
+        "a persist failure must not answer 200 success:true"
+    );
+    let body: serde_json::Value = resp.json().await?;
+    assert!(
+        body["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "the conflict must carry the persist error: {body}"
+    );
+
+    // The peer must not be in the initiator'"'"'s allowlist after the failure.
+    let peers = rhea.allowlist.list_peers().await?;
+    assert!(
+        peers.iter().all(|p| p.node_id != umbra.node.node_id()),
+        "an unpersisted peer must not appear in the allowlist"
+    );
+    let _ = std::fs::remove_file(&blocker);
+    Ok(())
+}
