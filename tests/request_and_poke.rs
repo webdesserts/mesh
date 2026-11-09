@@ -812,5 +812,29 @@ async fn two_node_pairing_populates_both_allowlists_with_real_names() -> anyhow:
         umbra.pending_pairing.lock().await.is_none(),
         "the armed code must be consumed by the first pairing"
     );
+
+    // Start poke gossip on both nodes and verify POST /poke -> GET /pokes over the wire.
+    umbra.start_poke_gossip().await?;
+    rhea.start_poke_gossip().await?;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let poke_resp = client
+        .post(format!("http://127.0.0.1:{umbra_port}/poke"))
+        .json(&serde_json::json!({
+            "appId": "feeds",
+            "topic": "autonomy",
+            "cursor": "m558",
+        }))
+        .send()
+        .await?;
+    assert!(poke_resp.status().is_success());
+    let pokes: webdesserts_mesh::api::PokesResp = client
+        .get(format!("http://127.0.0.1:{rhea_port}/pokes?since=0&timeout_ms=3000"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(pokes.pokes.len(), 1, "rhea must receive umbra's poke via POST /poke");
+    assert_eq!(pokes.pokes[0].cursor, "m558");
+    assert_eq!(pokes.pokes[0].from_device.as_deref(), Some("umbra"));
     Ok(())
 }

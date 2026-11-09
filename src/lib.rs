@@ -240,14 +240,19 @@ impl MeshDaemon {
                         PairingEvent::PairingCompleted { peer_id, device_name: peer_name } => {
                             match add_or_update_peer_unique(&allowlist, peer_id, &peer_name).await {
                                 Ok(name) => tracing::info!(peer = %peer_id, name = %name, "inbound mesh pairing completed"),
-                                Err(e) => tracing::warn!(peer = %peer_id, error = %e, "persist inbound paired peer failed"),
+                                Err(e) => {
+                                    tracing::warn!(peer = %peer_id, error = %e, "persist inbound paired peer failed");
+                                    continue;
+                                }
                             }
                             for relay in &relays {
                                 node.add_peer_relay(peer_id, relay);
                             }
                             let guard = gossip.lock().await;
                             if let Some(h) = guard.as_ref() {
-                                let _ = h.rejoin_peers(vec![peer_id]);
+                                if let Err(e) = h.rejoin_peers(vec![peer_id]).await {
+                                    tracing::warn!(peer = %peer_id, error = %e, "rejoin_peers after inbound pair failed");
+                                }
                             }
                         }
                         PairingEvent::PairingFailed { peer_id, reason } => {

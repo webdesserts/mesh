@@ -261,7 +261,10 @@ async fn poke(State(st): State<Arc<ApiState>>, Json(req): Json<PokeReq>) -> Resp
     let guard = st.gossip.lock().await;
     match guard.as_ref() {
         Some(h) => {
-            let _ = h.broadcast(Bytes::from(bytes));
+            if let Err(e) = h.broadcast(Bytes::from(bytes)).await {
+                tracing::warn!(error = %e, "gossip broadcast failed");
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
         }
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
@@ -353,7 +356,7 @@ struct PairReq {
     /// Optional friendly name override for the remote peer in our local
     /// allowlist. When omitted, the acceptor'"'"'s `challenge.device_name` from the
     /// handshake is used.
-    #[serde(default, alias = "device_name")]
+    #[serde(default)]
     peer_device_name: Option<String>,
     /// Optional relay URL override; when omitted, all `st.relays` are attached.
     #[serde(default)]
@@ -446,7 +449,14 @@ async fn pair(State(st): State<Arc<ApiState>>, Json(req): Json<PairReq>) -> Resp
                     });
                 match crate::add_or_update_peer_unique(&st.allowlist, peer, &desired).await {
                     Ok(name) => tracing::info!(peer = %peer, name = %name, "mesh pairing completed"),
-                    Err(e) => tracing::warn!(peer = %peer, error = %e, "persist paired peer failed"),
+                    Err(e) => {
+                        tracing::warn!(peer = %peer, error = %e, "persist paired peer failed");
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({ "error": e.to_string() })),
+                        )
+                            .into_response();
+                    }
                 }
                 for r in &st.relays {
                     st.node.add_peer_relay(peer, r);
@@ -458,7 +468,9 @@ async fn pair(State(st): State<Arc<ApiState>>, Json(req): Json<PairReq>) -> Resp
                 }
                 let guard = st.gossip.lock().await;
                 if let Some(h) = guard.as_ref() {
-                    let _ = h.rejoin_peers(vec![peer]);
+                    if let Err(e) = h.rejoin_peers(vec![peer]).await {
+                        tracing::warn!(peer = %peer, error = %e, "rejoin_peers after outbound pair failed");
+                    }
                 }
             }
             Json(res).into_response()

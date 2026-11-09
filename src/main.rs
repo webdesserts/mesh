@@ -32,7 +32,7 @@ enum Cmd {
         #[arg(long)]
         code: String,
         #[arg(long)]
-        device_name: Option<String>,
+        peer_device_name: Option<String>,
         #[arg(long)]
         dir: Option<String>,
     },
@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
         Cmd::Pair {
             peer,
             code,
-            device_name,
+            peer_device_name,
             dir,
         } => {
             let paths = paths(dir);
@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
             let body = serde_json::json!({
                 "peer": peer,
                 "code": code,
-                "device_name": device_name,
+                "peer_device_name": peer_device_name,
             });
             let resp = reqwest::Client::new()
                 .post(format!("{base}/pair"))
