@@ -25,9 +25,10 @@ use p2p_core::peer_addr::PeerAddr;
 use p2p_core::streams::{read_length_prefixed, write_length_prefixed};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+use webdesserts_mesh::MeshDaemon;
 use webdesserts_mesh::config::{AppTargetConfig, MeshConfig, MeshPaths};
 use webdesserts_mesh::poke::{MeshPokeWire, PokeInbox, poke_topic};
-use webdesserts_mesh::proxy::{HTTP_PROXY_ALPN, ProxyRequest, forward_with_body, new_pool};
+use webdesserts_mesh::proxy::{HTTP_PROXY_ALPN, ProxyRequest, forward_with_body, new_pool, should_strip_header};
 
 fn seed(n: u8) -> [u8; 32] {
     [n; 32]
@@ -112,6 +113,10 @@ fn api_state(
         pool: new_pool(),
         device_name: device_name.to_string(),
         self_id,
+        relays: Vec::new(),
+        pending_pairing: Arc::new(Mutex::new(None)),
+        notes_health_url: "http://127.0.0.1:8082/health".to_string(),
+        relay_listen: false,
     })
 }
 
@@ -552,13 +557,260 @@ async fn two_concurrent_pollers_both_wake_on_one_poke() -> anyhow::Result<()> {
 
     let ra = tokio::time::timeout(std::time::Duration::from_secs(10), a).await??;
     let rb = tokio::time::timeout(std::time::Duration::from_secs(10), b).await??;
-    let ja: Vec<webdesserts_mesh::poke::StoredPoke> = ra?.json().await?;
-    let jb: Vec<webdesserts_mesh::poke::StoredPoke> = rb?.json().await?;
+    let ja: webdesserts_mesh::api::PokesResp = ra?.json().await?;
+    let jb: webdesserts_mesh::api::PokesResp = rb?.json().await?;
 
-    assert_eq!(ja.len(), 1, "poller A must wake with the poke");
-    assert_eq!(jb.len(), 1, "poller B must wake with the poke");
-    assert_eq!(ja[0].seq, 1);
-    assert_eq!(jb[0].seq, 1);
+    assert_eq!(ja.pokes.len(), 1, "poller A must wake with the poke");
+    assert_eq!(jb.pokes.len(), 1, "poller B must wake with the poke");
+    assert_eq!(ja.pokes[0].seq, 1);
+    assert_eq!(jb.pokes[0].seq, 1);
+    assert_eq!(ja.epoch, jb.epoch, "both pollers see the same epoch");
+    assert!(!ja.truncated && !jb.truncated, "a live cursor is not truncated");
 
+    Ok(())
+}
+
+// ------------------------------------------ §6.7 Phase 3 acceptance (Part A)
+
+#[test]
+fn proxy_strips_caller_identity_headers() {
+    for h in [
+        "x-auth-user",
+        "x-auth-actor",
+        "x-autonomy-agent",
+        "x-mesh-peer-id",
+        "host",
+        "connection",
+        "transfer-encoding",
+    ] {
+        assert!(should_strip_header(h), "{h} must be stripped");
+    }
+    for h in ["content-type", "accept", "x-custom", "authorization"] {
+        assert!(!should_strip_header(h), "{h} must pass through");
+    }
+}
+
+fn wire(cursor: &str) -> MeshPokeWire {
+    MeshPokeWire {
+        app_id: "feeds".to_string(),
+        topic: "feeds".to_string(),
+        cursor: cursor.to_string(),
+        sender_peer_id: "peer".to_string(),
+        timestamp_ms: 0,
+        nonce: 0,
+    }
+}
+
+#[test]
+fn poke_inbox_reports_epoch_mismatch_ahead_and_eviction() {
+    let inbox = PokeInbox::with_epoch(2, 7);
+    inbox.push(wire("m1"), None);
+    inbox.push(wire("m2"), None);
+
+    // A live cursor is not truncated and reads from `since`.
+    let (pokes, truncated, eff) = inbox.read_since(0, Some(7), None);
+    assert_eq!(pokes.len(), 2);
+    assert!(!truncated);
+    assert_eq!(eff, 0);
+
+    // Epoch mismatch (daemon restart) resets to 0 and flags truncation.
+    let (pokes, truncated, eff) = inbox.read_since(2, Some(99), None);
+    assert_eq!(pokes.len(), 2, "a restart must deliver every buffered poke");
+    assert!(truncated);
+    assert_eq!(eff, 0);
+
+    // A cursor ahead of the latest seq is unusable.
+    let (_, truncated, _) = inbox.read_since(99, Some(7), None);
+    assert!(truncated);
+
+    // Ring-buffer eviction: cap 2, a third push evicts seq 1.
+    inbox.push(wire("m3"), None);
+    let (pokes, truncated, eff) = inbox.read_since(1, Some(7), None);
+    assert!(truncated, "a cursor at/below the evicted seq is truncated");
+    assert_eq!(eff, 0);
+    assert_eq!(pokes.len(), 2);
+    assert_eq!(pokes[0].cursor, "m2");
+}
+
+#[tokio::test]
+async fn unique_peer_names_suffix_on_clash_and_refuse_tombstones() -> anyhow::Result<()> {
+    let allowlist = file_allowlist("unique-names");
+    let a = p2p_core::PeerId::from_bytes(seed(11));
+    let b = p2p_core::PeerId::from_bytes(seed(12));
+
+    let n1 = webdesserts_mesh::add_or_update_peer_unique(&allowlist, a, "rhea").await?;
+    assert_eq!(n1, "rhea");
+    let n2 = webdesserts_mesh::add_or_update_peer_unique(&allowlist, b, "RHEA").await?;
+    assert!(
+        n2.starts_with("RHEA-"),
+        "a case-insensitive clash must be suffixed: {n2}"
+    );
+
+    allowlist.remove_peer(&a).await?;
+    let err = webdesserts_mesh::add_or_update_peer_unique(&allowlist, a, "rhea")
+        .await
+        .expect_err("a tombstoned peer must be refused");
+    assert!(
+        matches!(err, p2p_core::allowlist::AllowlistError::PeerRevoked(p) if p == a),
+        "expected PeerRevoked, got {err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_reports_phase3_fields() -> anyhow::Result<()> {
+    let allowlist = file_allowlist("status-p3");
+    let node = P2pNode::builder(seed(13), &[], allowlist.clone())
+        .mdns_service_name("wd-mesh-test")
+        .build()
+        .await?;
+    let inbox = Arc::new(PokeInbox::with_epoch(512, 42));
+    let state = api_state(
+        Arc::new(node),
+        allowlist,
+        Arc::new(HashMap::new()),
+        inbox,
+        Arc::new(Mutex::new(None)),
+        "umbra",
+    );
+    let port = spawn_api(state).await?;
+    let resp = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/status"))
+        .send()
+        .await?;
+    assert_eq!(resp.status().as_u16(), 200);
+    let j: serde_json::Value = resp.json().await?;
+    assert_eq!(j["relay_listen"], false);
+    assert_eq!(j["poke_epoch"], 42);
+    assert_eq!(j["latest_poke_seq"], 0);
+    assert!(
+        j["notes_sync_healthy"].is_boolean(),
+        "notes_sync_healthy must be reported"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pair_code_arms_a_single_use_code() -> anyhow::Result<()> {
+    let allowlist = file_allowlist("pair-code");
+    let node = P2pNode::builder(seed(14), &[], allowlist.clone())
+        .mdns_service_name("wd-mesh-test")
+        .build()
+        .await?;
+    let state = api_state(
+        Arc::new(node),
+        allowlist,
+        Arc::new(HashMap::new()),
+        Arc::new(PokeInbox::new(512)),
+        Arc::new(Mutex::new(None)),
+        "umbra",
+    );
+    let port = spawn_api(state.clone()).await?;
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/pair/code"))
+        .send()
+        .await?;
+    assert_eq!(resp.status().as_u16(), 200);
+    let j: serde_json::Value = resp.json().await?;
+    let code = j["code"].as_str().expect("code must be a string").to_string();
+    assert_eq!(code.len(), 6, "code must be 6 digits");
+    assert!(code.chars().all(|c| c.is_ascii_digit()));
+    assert_eq!(j["expires_in_secs"], 300);
+    let armed = state.pending_pairing.lock().await.clone();
+    assert_eq!(
+        armed.map(|p| p.code),
+        Some(code),
+        "the armed code must be stored for the inbound pump"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pair_refuses_revoked_peer_with_conflict() -> anyhow::Result<()> {
+    let allowlist = file_allowlist("pair-revoked");
+    let node = P2pNode::builder(seed(15), &[], allowlist.clone())
+        .mdns_service_name("wd-mesh-test")
+        .build()
+        .await?;
+    let peer = p2p_core::PeerId::from_bytes(seed(16));
+    allowlist.add_peer(peer, "rhea").await?;
+    allowlist.remove_peer(&peer).await?;
+    let state = api_state(
+        Arc::new(node),
+        allowlist,
+        Arc::new(HashMap::new()),
+        Arc::new(PokeInbox::new(512)),
+        Arc::new(Mutex::new(None)),
+        "umbra",
+    );
+    let port = spawn_api(state).await?;
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/pair"))
+        .json(&serde_json::json!({ "peer": peer.to_string(), "code": "123456" }))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.status().as_u16(),
+        409,
+        "a revoked peer must be refused before dialing"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_node_pairing_populates_both_allowlists_with_real_names() -> anyhow::Result<()> {
+    let tag = std::process::id();
+    let umbra_dir = std::env::temp_dir().join(format!("wd-mesh-pair-umbra-{tag}"));
+    let rhea_dir = std::env::temp_dir().join(format!("wd-mesh-pair-rhea-{tag}"));
+    let _ = std::fs::remove_dir_all(&umbra_dir);
+    let _ = std::fs::remove_dir_all(&rhea_dir);
+
+    let umbra = Arc::new(MeshDaemon::start(MeshPaths::at(&umbra_dir), MeshConfig::new("umbra")).await?);
+    let rhea = Arc::new(MeshDaemon::start(MeshPaths::at(&rhea_dir), MeshConfig::new("rhea")).await?);
+    seed_lookup(rhea.node.as_ref(), umbra.node.as_ref())?;
+
+    let umbra_port = spawn_api(umbra.api_state()).await?;
+    let rhea_port = spawn_api(rhea.api_state()).await?;
+    let client = reqwest::Client::new();
+
+    // Acceptor arms a single-use code; initiator dials with it.
+    let armed: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{umbra_port}/pair/code"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let code = armed["code"].as_str().expect("armed code").to_string();
+
+    let res: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{rhea_port}/pair"))
+        .json(&serde_json::json!({
+            "peer": umbra.node.node_id().to_string(),
+            "code": code,
+        }))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(res["success"], true, "pairing must succeed: {res}");
+
+    // Both sides record the peer'"'"'s real device name from the handshake:
+    // the initiator captures `challenge.device_name`, the acceptor uses the
+    // inbound hello'"'"'s `device_name`.
+    let umbra_peers = umbra.allowlist.list_peers().await?;
+    let rhea_peers = rhea.allowlist.list_peers().await?;
+    assert_eq!(umbra_peers.len(), 1, "umbra must record exactly one peer");
+    assert_eq!(rhea_peers.len(), 1, "rhea must record exactly one peer");
+    assert_eq!(umbra_peers[0].device_name, "rhea");
+    assert_eq!(rhea_peers[0].device_name, "umbra");
+    assert_eq!(umbra_peers[0].node_id, rhea.node.node_id());
+    assert_eq!(rhea_peers[0].node_id, umbra.node.node_id());
+
+    // The armed code was consumed, so a second inbound attempt has nothing to
+    // approve (single-use, #m550 B2).
+    assert!(
+        umbra.pending_pairing.lock().await.is_none(),
+        "the armed code must be consumed by the first pairing"
+    );
     Ok(())
 }

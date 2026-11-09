@@ -51,7 +51,21 @@ pub const HOP_BY_HOP: &[&str] = &[
 ];
 
 /// True when a header must be stripped before forwarding.
-pub fn is_hop_by_hop(name: &str) -> bool {
+/// Headers never forwarded to the local app.
+///
+/// Hop-by-hop headers, mesh identity headers, caller-supplied `x-auth-*` /
+/// `x-autonomy-*` identity (Caddy normally strips these; a peer must not be
+/// able to inject them into loopback feeds/autonomy), and `Host` (rewritten to
+/// the local app).
+pub fn should_strip_header(lower: &str) -> bool {
+    is_hop_by_hop(lower)
+        || lower.starts_with("x-mesh-")
+        || lower.starts_with("x-auth-")
+        || lower.starts_with("x-autonomy-")
+        || lower == "host"
+}
+
+fn is_hop_by_hop(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     HOP_BY_HOP.contains(&lower.as_str())
 }
@@ -220,7 +234,7 @@ impl<A: AllowlistStorage + Debug + Send + Sync + 'static> MeshHttpProxyHandler<A
             let lower = k.to_ascii_lowercase();
             // Strip hop-by-hop, identity, and Host: the upstream Host must name
             // the local app, never the mesh peer.
-            if is_hop_by_hop(&lower) || lower.starts_with("x-mesh-") || lower == "host" {
+            if should_strip_header(&lower) {
                 continue;
             }
             builder = builder.header(k.as_str(), v.as_str());

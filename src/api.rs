@@ -19,9 +19,10 @@ use p2p_core::PeerId;
 use p2p_core::allowlist::{AllowlistStorage, FileAllowlistStorage};
 use p2p_core::gossip::GossipHandle;
 use p2p_core::node::P2pNode;
-use p2p_core::pairing::PairingHello;
-use p2p_core::pairing_handler::pair_with_mesh;
+use p2p_core::pairing::{PairingHello, generate_pairing_code};
+use p2p_core::pairing_handler::pair_with_mesh_interactive;
 use p2p_core::peer_addr::PeerAddr;
+use p2p_core::relay_addr::RelayAddr;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -41,6 +42,14 @@ pub struct ApiState {
     pub pool: ConnPool,
     pub device_name: String,
     pub self_id: PeerId,
+    /// Public relays this node knows; attached to `PeerAddr` when dialing.
+    pub relays: Vec<RelayAddr>,
+    /// Single-use pairing code armed by `POST /pair/code`.
+    pub pending_pairing: Arc<Mutex<Option<crate::PendingPairing>>>,
+    /// Loopback health URL of `NotesSync.app`, probed by `GET /status`.
+    pub notes_health_url: String,
+    /// Whether the daemon started an embedded relay.
+    pub relay_listen: bool,
 }
 
 /// CSRF guard: refuse any request with an `Origin` header or a non-loopback
@@ -74,6 +83,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/poke", post(poke))
         .route("/pokes", get(pokes))
         .route("/pair", post(pair))
+        .route("/pair/code", post(pair_code))
         .layer(axum::middleware::from_fn(csrf_guard))
         .with_state(state)
 }
@@ -92,16 +102,40 @@ struct StatusResp {
     listen_addr: String,
     apps: Vec<String>,
     peers: usize,
+    relay_listen: bool,
+    poke_epoch: u64,
+    latest_poke_seq: u64,
+    notes_sync_healthy: bool,
+}
+
+/// Probe `NotesSync.app`'"'"'s loopback health endpoint with a 500ms timeout.
+async fn notes_sync_healthy(url: &str) -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match client.get(url).send().await {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
 }
 
 async fn status(State(st): State<Arc<ApiState>>) -> Response {
     let peers = st.allowlist.list_peers().await.map(|p| p.len()).unwrap_or(0);
+    let healthy = notes_sync_healthy(&st.notes_health_url).await;
     Json(StatusResp {
         device_name: st.device_name.clone(),
         peer_id: st.self_id.to_string(),
         listen_addr: crate::config::DEFAULT_LISTEN_ADDR.to_string(),
         apps: st.apps.keys().cloned().collect(),
         peers,
+        relay_listen: st.relay_listen,
+        poke_epoch: st.inbox.epoch(),
+        latest_poke_seq: st.inbox.latest_seq(),
+        notes_sync_healthy: healthy,
     })
     .into_response()
 }
@@ -247,30 +281,66 @@ struct PokesQuery {
     app_id: Option<String>,
     #[serde(default)]
     since: u64,
+    /// Per-boot epoch from a previous response; a mismatch means the daemon
+    /// restarted and the caller'"'"'s cursor is stale.
+    #[serde(default)]
+    epoch: Option<u64>,
     #[serde(default)]
     timeout_ms: u64,
+}
+
+/// Response envelope for `GET /pokes`.
+///
+/// `truncated` is `true` when the caller'"'"'s cursor is unusable (epoch mismatch,
+/// `since` ahead of the latest seq, or ring-buffer eviction); in that case the
+/// server resets to `since = 0` and returns every buffered poke.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PokesResp {
+    pub epoch: u64,
+    pub latest_seq: u64,
+    pub truncated: bool,
+    pub pokes: Vec<StoredPoke>,
+}
+
+fn pokes_resp(st: &ApiState, truncated: bool, pokes: Vec<StoredPoke>) -> Response {
+    Json(PokesResp {
+        epoch: st.inbox.epoch(),
+        latest_seq: st.inbox.latest_seq(),
+        truncated,
+        pokes,
+    })
+    .into_response()
 }
 
 /// Long-poll: return pokes with `seq > since`, or an empty list on timeout.
 ///
 /// Uses `watch` (not `Notify`): every concurrent poller sees every bump, so a
-/// second `GET /pokes` is not left waiting until `timeout_ms`.
+/// second `GET /pokes` is not left waiting until `timeout_ms`. The effective
+/// `since` (0 after a restart/eviction) drives both the first read and the
+/// long-poll wake check.
 async fn pokes(State(st): State<Arc<ApiState>>, Query(q): Query<PokesQuery>) -> Response {
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_millis(q.timeout_ms.min(30_000));
     let mut rx = st.inbox.subscribe();
+    let (immediate, truncated, effective_since) =
+        st.inbox.read_since(q.since, q.epoch, q.app_id.as_deref());
+    if !immediate.is_empty() || truncated || q.timeout_ms == 0 {
+        return pokes_resp(&st, truncated, immediate);
+    }
     loop {
-        let got = st.inbox.since(q.since, q.app_id.as_deref());
-        if !got.is_empty() {
-            return Json(got).into_response();
+        let (got, trunc, _) =
+            st.inbox
+                .read_since(effective_since, Some(st.inbox.epoch()), q.app_id.as_deref());
+        if !got.is_empty() || trunc {
+            return pokes_resp(&st, trunc, got);
         }
         if tokio::time::Instant::now() >= deadline {
-            return Json(Vec::<StoredPoke>::new()).into_response();
+            return pokes_resp(&st, false, Vec::new());
         }
         tokio::select! {
             _ = rx.changed() => {}
             _ = tokio::time::sleep_until(deadline) => {
-                return Json(Vec::<StoredPoke>::new()).into_response();
+                return pokes_resp(&st, false, Vec::new());
             }
         }
     }
@@ -280,8 +350,33 @@ async fn pokes(State(st): State<Arc<ApiState>>, Query(q): Query<PokesQuery>) -> 
 struct PairReq {
     peer: String,
     code: String,
+    /// Optional friendly name override for the remote peer in our local
+    /// allowlist. When omitted, the acceptor'"'"'s `challenge.device_name` from the
+    /// handshake is used.
+    #[serde(default, alias = "device_name")]
+    peer_device_name: Option<String>,
+    /// Optional relay URL override; when omitted, all `st.relays` are attached.
     #[serde(default)]
-    device_name: Option<String>,
+    relay_url: Option<String>,
+}
+
+/// Arm a single-use 6-digit pairing code on this (acceptor) node.
+///
+/// The first non-revoked inbound pairing request consumes it, so an attacker
+/// minting fresh `PeerId`s over the public relay cannot brute-force it.
+async fn pair_code(State(st): State<Arc<ApiState>>) -> Response {
+    let code = generate_pairing_code();
+    let pending = crate::PendingPairing {
+        code: code.clone(),
+        expires_at: std::time::Instant::now() + crate::PAIRING_CODE_TTL,
+    };
+    *st.pending_pairing.lock().await = Some(pending);
+    tracing::info!("armed single-use mesh pairing code (valid 300s)");
+    Json(serde_json::json!({
+        "code": code,
+        "expires_in_secs": crate::PAIRING_CODE_TTL.as_secs(),
+    }))
+    .into_response()
 }
 
 /// Pair with a peer, then persist it in the allowlist and join it to gossip.
@@ -290,20 +385,76 @@ async fn pair(State(st): State<Arc<ApiState>>, Json(req): Json<PairReq>) -> Resp
         Ok(p) => p,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let name = req
-        .device_name
-        .clone()
-        .unwrap_or_else(|| st.device_name.clone());
+    // S2: refuse a tombstoned peer before dialing.
+    match st.allowlist.list_peers().await {
+        Ok(peers) => {
+            if peers.iter().any(|p| p.node_id == peer && p.removed) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "peer is revoked" })),
+                )
+                    .into_response();
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "read allowlist before pairing failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    // Our own configured device name is authoritative on the wire.
     let hello = PairingHello {
         node_id: st.self_id,
-        device_name: name.clone(),
+        device_name: st.device_name.clone(),
     };
+    let mut peer_addr = PeerAddr::new(peer);
+    if let Some(ref url_str) = req.relay_url {
+        match RelayAddr::parse(url_str) {
+            Ok(r) => peer_addr = peer_addr.with_relay(r),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        for r in &st.relays {
+            peer_addr = peer_addr.with_relay(r.clone());
+        }
+    }
     let dial = st.node.dial_handle();
-    match pair_with_mesh(&dial, PeerAddr::new(peer), &hello, &req.code).await {
+    let captured: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let captured_clone = captured.clone();
+    let code = req.code.clone();
+    let res = pair_with_mesh_interactive(&dial, peer_addr, &hello, move |challenge| {
+        *captured_clone.lock().unwrap() = Some(challenge.device_name);
+        async move { Ok(code) }
+    })
+    .await;
+    match res {
         Ok(res) => {
             if res.success {
-                if let Err(e) = st.allowlist.add_peer(peer, &name).await {
-                    tracing::warn!(error = %e, "persist paired peer failed");
+                // S1: prefer the acceptor'"'"'s real device name from the handshake.
+                let desired = req
+                    .peer_device_name
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| captured.lock().unwrap().clone())
+                    .unwrap_or_else(|| {
+                        let hex = peer.to_string();
+                        format!("peer-{}", &hex[..8.min(hex.len())])
+                    });
+                match crate::add_or_update_peer_unique(&st.allowlist, peer, &desired).await {
+                    Ok(name) => tracing::info!(peer = %peer, name = %name, "mesh pairing completed"),
+                    Err(e) => tracing::warn!(peer = %peer, error = %e, "persist paired peer failed"),
+                }
+                for r in &st.relays {
+                    st.node.add_peer_relay(peer, r);
+                }
+                for url in &res.relay_urls {
+                    if let Ok(r) = RelayAddr::parse(url) {
+                        st.node.add_peer_relay(peer, &r);
+                    }
                 }
                 let guard = st.gossip.lock().await;
                 if let Some(h) = guard.as_ref() {

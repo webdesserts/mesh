@@ -8,6 +8,10 @@
 //!
 //! `from_device` is resolved from the **receiver'"'"'s** allowlist by
 //! `sender_peer_id`; it is never taken from the sender-claimed name.
+//!
+//! `epoch` is a random per-boot value: a client polling with a `since` from
+//! before a daemon restart sees `truncated: true` and an `effective_since` of
+//! 0, so post-restart pokes are delivered instead of silently filtered out.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -63,6 +67,10 @@ pub struct PokeInbox {
     next_seq: AtomicU64,
     tx: watch::Sender<u64>,
     cap: usize,
+    /// Random per-boot epoch: lets a client detect a daemon restart.
+    epoch: u64,
+    /// Highest `seq` evicted from the ring buffer (0 = nothing evicted yet).
+    evicted_seq: AtomicU64,
 }
 
 impl Default for PokeInbox {
@@ -73,12 +81,19 @@ impl Default for PokeInbox {
 
 impl PokeInbox {
     pub fn new(cap: usize) -> Self {
+        Self::with_epoch(cap, rand::random::<u64>().max(1))
+    }
+
+    /// Build an inbox with an explicit epoch (tests use a fixed value).
+    pub fn with_epoch(cap: usize, epoch: u64) -> Self {
         let (tx, _rx) = watch::channel(0u64);
         Self {
             inner: std::sync::Mutex::new(VecDeque::new()),
             next_seq: AtomicU64::new(1),
             tx,
             cap,
+            epoch,
+            evicted_seq: AtomicU64::new(0),
         }
     }
 
@@ -104,7 +119,9 @@ impl PokeInbox {
         };
         let mut q = self.inner.lock().expect("poke inbox poisoned");
         if q.len() >= self.cap {
-            q.pop_front();
+            if let Some(evicted) = q.pop_front() {
+                self.evicted_seq.store(evicted.seq, Ordering::SeqCst);
+            }
         }
         q.push_back(stored);
         drop(q);
@@ -122,9 +139,43 @@ impl PokeInbox {
             .collect()
     }
 
+    /// Read pokes with restart/eviction recovery.
+    ///
+    /// Returns `(pokes, truncated, effective_since)`. `truncated` is `true` when
+    /// the caller'"'"'s `epoch` does not match this inbox'"'"'s epoch (daemon restart),
+    /// when `since` is ahead of the latest seq, or when `since` fell behind the
+    /// ring buffer. In every truncated case `effective_since` is 0, so the
+    /// caller sees every buffered poke instead of silently filtering them out.
+    pub fn read_since(
+        &self,
+        since: u64,
+        req_epoch: Option<u64>,
+        app_id: Option<&str>,
+    ) -> (Vec<StoredPoke>, bool, u64) {
+        let latest = self.latest_seq();
+        let evicted = self.evicted_seq.load(Ordering::SeqCst);
+        let truncated = req_epoch.is_some_and(|e| e != self.epoch)
+            || since > latest
+            || (since > 0 && since <= evicted);
+        let effective_since = if truncated { 0 } else { since };
+        let q = self.inner.lock().expect("poke inbox poisoned");
+        let pokes = q
+            .iter()
+            .filter(|w| w.seq > effective_since)
+            .filter(|w| app_id.is_none_or(|a| w.app_id == a))
+            .cloned()
+            .collect();
+        (pokes, truncated, effective_since)
+    }
+
     /// Latest receiver-local seq.
     pub fn latest_seq(&self) -> u64 {
         *self.tx.borrow()
+    }
+
+    /// Random per-boot epoch.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 }
 

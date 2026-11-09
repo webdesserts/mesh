@@ -14,10 +14,13 @@ pub mod proxy;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use p2p_core::PeerId;
-use p2p_core::allowlist::{AllowlistStorage, FileAllowlistStorage};
+use p2p_core::allowlist::{AllowlistError, AllowlistStorage, FileAllowlistStorage};
+use p2p_core::pairing::PairingChallenge;
+use p2p_core::pairing_handler::{PairingApproval, PairingEvent};
 use p2p_core::daemon_lock::DaemonLock;
 use p2p_core::gossip::{GossipEvent, GossipHandle};
 use p2p_core::identity::IdentityKey;
@@ -35,6 +38,52 @@ use crate::proxy::{ConnPool, HTTP_PROXY_ALPN, MeshHttpProxyHandler, new_pool};
 /// it short and valid.
 pub const MDNS_SERVICE_NAME: &str = "wd-mesh";
 
+/// How long a code armed by `POST /pair/code` stays valid.
+pub const PAIRING_CODE_TTL: Duration = Duration::from_secs(300);
+
+/// A single-use pairing code armed on the acceptor (`POST /pair/code`).
+///
+/// The first non-revoked inbound `PairingEvent::InboundRequest` consumes it
+/// (`take()`), so an attacker minting fresh `PeerId`s over the public relay
+/// cannot brute-force the code across multiple connections.
+#[derive(Debug, Clone)]
+pub struct PendingPairing {
+    pub code: String,
+    pub expires_at: Instant,
+}
+
+/// Add or update a peer, keeping device names unique (case-insensitive).
+///
+/// `resolve_target` matches `device_name` case-insensitively and returns the
+/// first match, so two active peers sharing a name would be ambiguous. When a
+/// different active peer already holds `desired_name`, suffix `-<8hex>`.
+///
+/// A tombstoned peer (`removed = true`) is refused with
+/// `AllowlistError::PeerRevoked` before anything is written.
+pub async fn add_or_update_peer_unique(
+    allowlist: &Arc<FileAllowlistStorage>,
+    peer_id: PeerId,
+    desired_name: &str,
+) -> Result<String, AllowlistError> {
+    let peers = allowlist.list_peers().await?;
+    if peers.iter().any(|p| p.node_id == peer_id && p.removed) {
+        return Err(AllowlistError::PeerRevoked(peer_id));
+    }
+    let desired = desired_name.trim();
+    let desired = if desired.is_empty() { "peer" } else { desired };
+    let clash = peers.iter().any(|p| {
+        p.node_id != peer_id && !p.removed && p.device_name.eq_ignore_ascii_case(desired)
+    });
+    let final_name = if clash {
+        let hex = peer_id.to_string();
+        format!("{desired}-{}", &hex[..8.min(hex.len())])
+    } else {
+        desired.to_string()
+    };
+    allowlist.add_peer(peer_id, final_name.clone()).await?;
+    Ok(final_name)
+}
+
 /// A running mesh daemon.
 pub struct MeshDaemon {
     pub node: Arc<P2pNode>,
@@ -46,6 +95,15 @@ pub struct MeshDaemon {
     pub self_id: PeerId,
     pub apps: Arc<HashMap<String, AppTargetConfig>>,
     pub paths: MeshPaths,
+    /// Public relays this node knows. Seeded into iroh'"'"'s `MemoryLookup` for
+    /// every paired peer so off-LAN `PeerId`s resolve without mDNS.
+    pub relays: Vec<RelayAddr>,
+    /// Single-use pairing code armed by `POST /pair/code`.
+    pub pending_pairing: Arc<Mutex<Option<PendingPairing>>>,
+    /// Loopback health URL of `NotesSync.app`, probed by `GET /status`.
+    pub notes_health_url: String,
+    /// Whether this daemon started an embedded relay (`relay_listen = true`).
+    pub relay_listen: bool,
     /// Embedded relay, held for the Phase 3 cutover. `None` unless
     /// `relay_listen = true` (default false: NotesSync owns `0.0.0.0:3340`).
     _relay: Option<EmbeddedRelay>,
@@ -98,23 +156,122 @@ impl MeshDaemon {
 
         let handler = MeshHttpProxyHandler::new(allowlist.clone(), apps.clone());
 
-        let node = P2pNode::builder(identity.secret_key_bytes(), &relays, allowlist.clone())
+        let mut node = P2pNode::builder(identity.secret_key_bytes(), &relays, allowlist.clone())
             .mdns_service_name(MDNS_SERVICE_NAME)
             .with_protocol(HTTP_PROXY_ALPN, handler)
             .build()
             .await
             .context("build p2p node")?;
 
+        // A.1: seed relay hints for every existing non-removed peer so iroh'"'"'s
+        // `MemoryLookup` resolves off-LAN `PeerId`s without mDNS.
+        for peer in allowlist.list_peers().await.unwrap_or_default() {
+            if !peer.removed && peer.node_id != self_id {
+                for relay in &relays {
+                    node.add_peer_relay(peer.node_id, relay);
+                }
+            }
+        }
+
+        // A.2: take the inbound pairing receiver out of the node so the daemon
+        // can drive it (zero `p2p-core` changes; the field is `pub`).
+        let (_dummy_tx, dummy_rx) = tokio::sync::mpsc::unbounded_channel::<PairingEvent>();
+        let mut inbound_pairing_rx = std::mem::replace(&mut node.inbound_pairing_rx, dummy_rx);
+
+        let node = Arc::new(node);
+        let pending_pairing: Arc<Mutex<Option<PendingPairing>>> = Arc::new(Mutex::new(None));
+        let gossip: Arc<Mutex<Option<GossipHandle>>> = Arc::new(Mutex::new(None));
+        let device_name = cfg.device_name.clone();
+        let notes_health_url = cfg.notes_health_url.clone();
+        let relay_listen = cfg.relay_listen;
+
+        // A.2: drive inbound pairing requests. The code is single-use and is
+        // consumed only by a non-revoked peer, so it cannot be brute-forced
+        // across fresh `PeerId`s over the public relay.
+        {
+            let node = node.clone();
+            let allowlist = allowlist.clone();
+            let gossip = gossip.clone();
+            let pending_pairing = pending_pairing.clone();
+            let relays = relays.clone();
+            let device_name = device_name.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = inbound_pairing_rx.recv().await {
+                    match ev {
+                        PairingEvent::InboundRequest(exchange) => {
+                            let peer_id = exchange.remote_id;
+                            // S2: reject a revoked peer before consuming the code.
+                            let peers = allowlist.list_peers().await.unwrap_or_default();
+                            if peers.iter().any(|p| p.node_id == peer_id && p.removed) {
+                                tracing::warn!(peer = %peer_id, "rejecting inbound pairing from revoked peer");
+                                drop(exchange.reply_tx);
+                                continue;
+                            }
+                            // B2: consume the single-use code on the first
+                            // non-revoked inbound request.
+                            let pending = pending_pairing.lock().await.take();
+                            let Some(pending) = pending else {
+                                tracing::warn!(peer = %peer_id, "no armed pairing code; rejecting inbound pairing");
+                                drop(exchange.reply_tx);
+                                continue;
+                            };
+                            if Instant::now() >= pending.expires_at {
+                                tracing::warn!(peer = %peer_id, "armed pairing code expired; rejecting inbound pairing");
+                                drop(exchange.reply_tx);
+                                continue;
+                            }
+                            let mesh_members: Vec<PeerId> = peers
+                                .iter()
+                                .filter(|p| !p.removed)
+                                .map(|p| p.node_id)
+                                .collect();
+                            let approval = PairingApproval {
+                                code: pending.code,
+                                challenge: PairingChallenge {
+                                    node_id: self_id,
+                                    device_name: device_name.clone(),
+                                },
+                                vault_topic: *poke_topic().as_bytes(),
+                                relay_urls: relays.iter().map(|r| r.as_str()).collect(),
+                                mesh_members,
+                            };
+                            let _ = exchange.reply_tx.send(approval);
+                        }
+                        PairingEvent::PairingCompleted { peer_id, device_name: peer_name } => {
+                            match add_or_update_peer_unique(&allowlist, peer_id, &peer_name).await {
+                                Ok(name) => tracing::info!(peer = %peer_id, name = %name, "inbound mesh pairing completed"),
+                                Err(e) => tracing::warn!(peer = %peer_id, error = %e, "persist inbound paired peer failed"),
+                            }
+                            for relay in &relays {
+                                node.add_peer_relay(peer_id, relay);
+                            }
+                            let guard = gossip.lock().await;
+                            if let Some(h) = guard.as_ref() {
+                                let _ = h.rejoin_peers(vec![peer_id]);
+                            }
+                        }
+                        PairingEvent::PairingFailed { peer_id, reason } => {
+                            tracing::warn!(%peer_id, %reason, "inbound mesh pairing failed");
+                        }
+                    }
+                }
+            });
+        }
+
         Ok(Self {
-            node: Arc::new(node),
+            node,
             allowlist,
             inbox: Arc::new(PokeInbox::new(512)),
-            gossip: Arc::new(Mutex::new(None)),
+            gossip,
             pool: new_pool(),
             device_name: cfg.device_name,
             self_id,
             apps,
             paths,
+            relays,
+            pending_pairing,
+            notes_health_url,
+            relay_listen,
             _relay: relay,
             _lock: lock,
         })
@@ -189,6 +346,10 @@ impl MeshDaemon {
             pool: self.pool.clone(),
             device_name: self.device_name.clone(),
             self_id: self.self_id,
+            relays: self.relays.clone(),
+            pending_pairing: self.pending_pairing.clone(),
+            notes_health_url: self.notes_health_url.clone(),
+            relay_listen: self.relay_listen,
         })
     }
 

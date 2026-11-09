@@ -12,12 +12,19 @@ pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:4620";
 /// Default embedded-relay bind address (Phase 3 cutover).
 pub const DEFAULT_RELAY_BIND: &str = "0.0.0.0:3340";
 
+/// Default loopback health endpoint of `NotesSync.app` (vault sync).
+pub const DEFAULT_NOTES_HEALTH_URL: &str = "http://127.0.0.1:8082/health";
+
 fn default_listen_addr() -> String {
     DEFAULT_LISTEN_ADDR.to_string()
 }
 
 fn default_relay_bind() -> Option<String> {
     Some(DEFAULT_RELAY_BIND.to_string())
+}
+
+fn default_notes_health_url() -> String {
+    DEFAULT_NOTES_HEALTH_URL.to_string()
 }
 
 /// Per-app forwarding target: either a loopback `port` or a `base_url`.
@@ -102,6 +109,10 @@ pub struct MeshConfig {
     pub relay_listen: bool,
     #[serde(default = "default_relay_bind")]
     pub relay_bind: Option<String>,
+    /// Loopback health URL of `NotesSync.app`; `/status` probes it with a
+    /// 500ms timeout to report `notes_sync_healthy`.
+    #[serde(default = "default_notes_health_url")]
+    pub notes_health_url: String,
     #[serde(default)]
     pub apps: BTreeMap<String, AppTargetConfig>,
 }
@@ -114,6 +125,7 @@ impl MeshConfig {
             known_public_relays: Vec::new(),
             relay_listen: false,
             relay_bind: default_relay_bind(),
+            notes_health_url: default_notes_health_url(),
             apps: BTreeMap::new(),
         }
     }
