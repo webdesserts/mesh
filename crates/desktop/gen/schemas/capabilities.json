@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capability for the Mesh pairing window","local":true,"windows":["pair"],"permissions":["core:default"]}}

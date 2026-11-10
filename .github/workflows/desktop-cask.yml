@@ -1,0 +1,147 @@
+name: Desktop cask
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact existing stable release tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      sha256:
+        description: Expected pre-upload DMG SHA-256 from publisher receipt
+        required: true
+        type: string
+      macos_floor:
+        description: Explicit owner-reviewed Homebrew macOS floor symbol
+        required: true
+        type: string
+      intent:
+        description: Verify only unless publication is explicitly approved
+        required: true
+        type: choice
+        default: verify
+        options:
+          - verify
+          - publish
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-15
+    outputs:
+      candidate_verified: ${{ steps.candidate.outputs.verified }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      EXPECTED_SHA256: ${{ inputs.sha256 }}
+      MACOS_FLOOR: ${{ inputs.macos_floor }}
+      HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tooling
+          persist-credentials: false
+      - name: Download exact public asset and validate pinned signer and bytes
+        shell: python {0}
+        run: |
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+          import urllib.request
+          sys.path.insert(0, str(Path('tooling/scripts/t299').resolve()))
+          from artifact_validator import digest, load_config, require, validate
+          from cask_gate import asset_url, generate, version
+          tag = os.environ['RELEASE_TAG']
+          expected = os.environ['EXPECTED_SHA256'].lower()
+          generate(tag, expected, os.environ['MACOS_FLOOR'])
+          config = Path('tooling/scripts/t299/signer_config.json')
+          load_config(config)  # Reviewed public values; never derive identity from the artifact.
+          artifact = Path(os.environ['RUNNER_TEMP']) / ('Mesh_' + version(tag) + '_universal.dmg')
+          with urllib.request.urlopen(asset_url(tag), timeout=120) as response, artifact.open('xb') as output:
+              shutil.copyfileobj(response, output)
+          require(digest(artifact) == expected, 'downloaded SHA differs from pre-upload receipt')
+          receipt = validate(artifact, version(tag), config)
+          require(receipt['sha256'] == expected, 'validated bytes differ from dispatch digest')
+      - name: Checkout public tap read-only
+        uses: actions/checkout@v4
+        with:
+          repository: webdesserts/homebrew-tap
+          ref: main
+          path: tap
+          persist-credentials: false
+      - name: Gate the exact candidate without publication credentials
+        id: candidate
+        shell: python {0}
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+          subprocess.run([
+              '/usr/bin/python3', '-B', 'tooling/scripts/t299/cask_gate.py',
+              '--tap', str(Path('tap').resolve()),
+              '--tag', os.environ['RELEASE_TAG'],
+              '--sha256', os.environ['EXPECTED_SHA256'],
+              '--macos-floor', os.environ['MACOS_FLOOR'],
+          ], check=True)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('verified=true\n')
+
+  publish:
+    needs: verify
+    if: ${{ inputs.intent == 'publish' && needs.verify.outputs.candidate_verified == 'true' && vars.DESKTOP_CASK_PUBLISH_ENABLED == 'true' }}
+    environment: desktop-cask-publication
+    runs-on: macos-15
+    permissions:
+      actions: read
+      contents: read
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      EXPECTED_SHA256: ${{ inputs.sha256 }}
+      MACOS_FLOOR: ${{ inputs.macos_floor }}
+      HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tooling
+          persist-credentials: false
+      # Defensive query, not an atomic lock or FIFO guarantee. The owner must
+      # prevent NEW release OR desktop publication runs until this job completes.
+      # Broader automatic publication remains disabled and out of scope.
+      - name: Refuse other nonterminal writers before tap checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python {0}
+        run: |
+          import os
+          import subprocess
+          subprocess.run([
+              '/usr/bin/python3', '-B', 'tooling/scripts/t299/cask_gate.py',
+              '--operation', 'check-queue', '--run-id', os.environ['GITHUB_RUN_ID'],
+          ], check=True)
+      - name: Checkout fresh authenticated tap only after queue preflight
+        uses: actions/checkout@v4
+        with:
+          repository: webdesserts/homebrew-tap
+          ref: main
+          path: tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          persist-credentials: true
+      - name: Rerun candidate gates and explicitly publish fast-forward only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python {0}
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+          subprocess.run([
+              '/usr/bin/python3', '-B', 'tooling/scripts/t299/cask_gate.py',
+              '--operation', 'publish', '--run-id', os.environ['GITHUB_RUN_ID'],
+              '--signer-config', 'tooling/scripts/t299/signer_config.json',
+              '--tap', str(Path('tap').resolve()),
+              '--tag', os.environ['RELEASE_TAG'],
+              '--sha256', os.environ['EXPECTED_SHA256'],
+              '--macos-floor', os.environ['MACOS_FLOOR'],
+          ], check=True)

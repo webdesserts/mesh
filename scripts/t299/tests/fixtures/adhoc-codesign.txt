@@ -1,0 +1,6 @@
+Executable=/fixture/Mesh.app/Contents/MacOS/desktop
+Identifier=com.webdesserts.mesh
+Format=app bundle with Mach-O universal (x86_64 arm64)
+CodeDirectory v=20400 size=123 flags=0x20002(adhoc,linker-signed) hashes=1+0 location=embedded
+Signature=adhoc
+TeamIdentifier=not set

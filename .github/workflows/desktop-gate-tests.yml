@@ -1,0 +1,57 @@
+name: Desktop gate tests
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/t299/**'
+      - '.github/workflows/desktop-gate-tests.yml'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/desktop-cask.yml'
+  push:
+    paths:
+      - 'scripts/t299/**'
+      - '.github/workflows/desktop-gate-tests.yml'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/desktop-cask.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  hermetic-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run artifact, publisher, cask and workflow stdlib fixture suite
+        shell: python {0}
+        run: |
+          import subprocess
+          subprocess.run([
+              '/usr/bin/python3', '-B', '-m', 'unittest', 'discover',
+              '-s', 'scripts/t299/tests', '-v',
+          ], check=True)
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.2'
+          cache: false
+      - name: Install pinned workflow linter (CI only)
+        shell: python {0}
+        run: |
+          import subprocess
+          subprocess.run([
+              'go', 'install',
+              'github.com/rhysd/actionlint/cmd/actionlint@v1.7.7',
+          ], check=True)
+      - name: Lint gate and existing release workflows
+        shell: python {0}
+        run: |
+          from pathlib import Path
+          import subprocess
+          subprocess.run([
+              str(Path.home() / 'go/bin/actionlint'),
+              '.github/workflows/desktop-gate-tests.yml',
+              '.github/workflows/release.yml',
+              '.github/workflows/desktop-cask.yml',
+          ], check=True)

@@ -1,0 +1,22 @@
+{
+  "common_name": "ObsidianMemory Dev Signing",
+  "der_sha256": "646699720919732dab6e23ec233bae54586e3947af5a9df57bd9505a5f62710e",
+  "designated_requirement": "identifier \"com.webdesserts.mesh\" and certificate root = H\"aea71c71c40d1a9b217e806b3c41791c06a3b0cc\"",
+  "observations": {
+    "spctl": {
+      "exit_code": 3,
+      "stdout_lines": [],
+      "stderr_lines": [
+        "{path}: rejected"
+      ]
+    },
+    "ticket": {
+      "exit_code": 65,
+      "stdout_lines": [
+        "Processing: {path}",
+        "Mesh.app does not have a ticket stapled to it."
+      ],
+      "stderr_lines": []
+    }
+  }
+}
