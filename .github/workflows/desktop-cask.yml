@@ -50,13 +50,13 @@ jobs:
           import shutil
           import sys
           import urllib.request
-          sys.path.insert(0, str(Path('tooling/scripts/t299').resolve()))
+          sys.path.insert(0, str(Path('scripts/t299').resolve()))
           from artifact_validator import digest, load_config, require, validate
           from cask_gate import asset_url, generate, version
           tag = os.environ['RELEASE_TAG']
           expected = os.environ['EXPECTED_SHA256'].lower()
           generate(tag, expected, os.environ['MACOS_FLOOR'])
-          config = Path('tooling/scripts/t299/signer_config.json')
+          config = Path('scripts/t299/signer_config.json')
           load_config(config)  # Reviewed public values; never derive identity from the artifact.
           artifact = Path(os.environ['RUNNER_TEMP']) / ('Mesh_' + version(tag) + '_universal.dmg')
           with urllib.request.urlopen(asset_url(tag), timeout=120) as response, artifact.open('xb') as output:
@@ -79,7 +79,7 @@ jobs:
           from pathlib import Path
           import subprocess
           subprocess.run([
-              '/usr/bin/python3', '-B', 'tooling/scripts/t299/cask_gate.py',
+              '/usr/bin/python3', '-B', 'scripts/t299/cask_gate.py',
               '--tap', str(Path('tap').resolve()),
               '--tag', os.environ['RELEASE_TAG'],
               '--sha256', os.environ['EXPECTED_SHA256'],
@@ -117,7 +117,7 @@ jobs:
           import os
           import subprocess
           subprocess.run([
-              '/usr/bin/python3', '-B', 'tooling/scripts/t299/cask_gate.py',
+              '/usr/bin/python3', '-B', 'scripts/t299/cask_gate.py',
               '--operation', 'check-queue', '--run-id', os.environ['GITHUB_RUN_ID'],
           ], check=True)
       - name: Checkout fresh authenticated tap only after queue preflight
@@ -137,9 +137,9 @@ jobs:
           from pathlib import Path
           import subprocess
           subprocess.run([
-              '/usr/bin/python3', '-B', 'tooling/scripts/t299/cask_gate.py',
+              '/usr/bin/python3', '-B', 'scripts/t299/cask_gate.py',
               '--operation', 'publish', '--run-id', os.environ['GITHUB_RUN_ID'],
-              '--signer-config', 'tooling/scripts/t299/signer_config.json',
+              '--signer-config', 'scripts/t299/signer_config.json',
               '--tap', str(Path('tap').resolve()),
               '--tag', os.environ['RELEASE_TAG'],
               '--sha256', os.environ['EXPECTED_SHA256'],
