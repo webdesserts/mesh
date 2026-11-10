@@ -139,11 +139,6 @@ jobs:
             fi
           fi
         shell: "bash"
-      - name: "Download embedding model"
-        run: |
-          chmod +x scripts/download-model.sh
-          ./scripts/download-model.sh
-        shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
