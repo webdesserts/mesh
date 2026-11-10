@@ -25,6 +25,9 @@ install-path = "CARGO_HOME"
 # `--workspace`, so the non-dist `mesh-desktop` crate (dist = false) is never
 # compiled — its Tauri deps break the cross-target builds.
 precise-builds = true
+# The release workflow is hand-augmented with a desktop DMG job that dist does
+# not generate; tell dist not to enforce ci-file freshness against it.
+allow-dirty = ["ci"]
 
 # GitHub retired the macos-14 runner images on 2026-11-02; dist 0.30.3 still
 # defaults aarch64-apple-darwin to macos-14, which cancels the job at start.
