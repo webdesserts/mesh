@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-p2p-core = { git = "https://github.com/webdesserts/p2p-core.git", tag = "v0.1.4" }
+p2p-core = { git = "https://github.com/webdesserts/p2p-core.git", tag = "v0.1.5" }
 anyhow = "1.0"
 axum = "0.8"
 blake3 = "1"
@@ -25,4 +25,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-p2p-core = { git = "https://github.com/webdesserts/p2p-core.git", tag = "v0.1.4", features = ["test-util"] }
+p2p-core = { git = "https://github.com/webdesserts/p2p-core.git", tag = "v0.1.5", features = ["test-util"] }
