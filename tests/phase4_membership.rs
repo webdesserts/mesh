@@ -495,22 +495,6 @@ async fn register_sock_mints_token_enforces_bearer_and_blocks_hijack() -> anyhow
     Ok(())
 }
 
-// ------------------------------- §3.2 #7 idempotent retry without suffix
-
-#[tokio::test]
-async fn same_peer_retry_is_idempotent_without_suffix() -> anyhow::Result<()> {
-    let path = std::env::temp_dir().join(format!("wd-mesh-idem-{}.json", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let allow = Arc::new(FileAllowlistStorage::at_path(path));
-    let peer = p2p_core::PeerId::from_bytes(seed(21));
-    let first = webdesserts_mesh::add_or_update_peer_unique(&allow, peer, "rhea").await?;
-    assert_eq!(first, "rhea", "the first registration keeps the name");
-    let second = webdesserts_mesh::add_or_update_peer_unique(&allow, peer, "rhea").await?;
-    assert_eq!(second, "rhea", "a retry must not gain a -2 suffix");
-    assert_eq!(allow.list_peers().await?.len(), 1, "a retry must not duplicate");
-    Ok(())
-}
-
 // ------------------- §3.2 #5 permission broker: mesh_id + friend isolation
 
 #[tokio::test]

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use p2p_core::PeerId;
-use p2p_core::allowlist::{AllowlistError, AllowlistStorage, FileAllowlistStorage};
+use p2p_core::allowlist::{AllowlistStorage, FileAllowlistStorage};
 use p2p_core::pairing::PairingChallenge;
 use p2p_core::pairing_handler::{PairingApproval, PairingEvent};
 use p2p_core::daemon_lock::DaemonLock;
@@ -62,35 +62,6 @@ pub struct PendingPairing {
 /// Add or update a peer, keeping device names unique (case-insensitive).
 ///
 /// `resolve_target` matches `device_name` case-insensitively and returns the
-/// first match, so two active peers sharing a name would be ambiguous. When a
-/// different active peer already holds `desired_name`, suffix `-<8hex>`.
-///
-/// A tombstoned peer (`removed = true`) is refused with
-/// `AllowlistError::PeerRevoked` before anything is written.
-pub async fn add_or_update_peer_unique(
-    allowlist: &Arc<FileAllowlistStorage>,
-    peer_id: PeerId,
-    desired_name: &str,
-) -> Result<String, AllowlistError> {
-    let peers = allowlist.list_peers().await?;
-    if peers.iter().any(|p| p.node_id == peer_id && p.removed) {
-        return Err(AllowlistError::PeerRevoked(peer_id));
-    }
-    let desired = desired_name.trim();
-    let desired = if desired.is_empty() { "peer" } else { desired };
-    let clash = peers.iter().any(|p| {
-        p.node_id != peer_id && !p.removed && p.device_name.eq_ignore_ascii_case(desired)
-    });
-    let final_name = if clash {
-        let hex = peer_id.to_string();
-        format!("{desired}-{}", &hex[..8.min(hex.len())])
-    } else {
-        desired.to_string()
-    };
-    allowlist.add_peer(peer_id, final_name.clone()).await?;
-    Ok(final_name)
-}
-
 /// A running mesh daemon.
 pub struct MeshDaemon {
     pub node: Arc<P2pNode>,

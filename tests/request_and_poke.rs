@@ -736,31 +736,6 @@ fn poke_inbox_reports_epoch_mismatch_ahead_and_eviction() {
 }
 
 #[tokio::test]
-async fn unique_peer_names_suffix_on_clash_and_refuse_tombstones() -> anyhow::Result<()> {
-    let allowlist = file_allowlist("unique-names");
-    let a = p2p_core::PeerId::from_bytes(seed(11));
-    let b = p2p_core::PeerId::from_bytes(seed(12));
-
-    let n1 = webdesserts_mesh::add_or_update_peer_unique(&allowlist, a, "rhea").await?;
-    assert_eq!(n1, "rhea");
-    let n2 = webdesserts_mesh::add_or_update_peer_unique(&allowlist, b, "RHEA").await?;
-    assert!(
-        n2.starts_with("RHEA-"),
-        "a case-insensitive clash must be suffixed: {n2}"
-    );
-
-    allowlist.remove_peer(&a).await?;
-    let err = webdesserts_mesh::add_or_update_peer_unique(&allowlist, a, "rhea")
-        .await
-        .expect_err("a tombstoned peer must be refused");
-    assert!(
-        matches!(err, p2p_core::allowlist::AllowlistError::PeerRevoked(p) if p == a),
-        "expected PeerRevoked, got {err:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn status_reports_phase3_fields() -> anyhow::Result<()> {
     let allowlist = file_allowlist("status-p3");
     let node = P2pNode::builder(seed(13), &[], allowlist.clone())
