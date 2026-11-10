@@ -199,13 +199,14 @@ impl MeshDaemon {
             None
         };
 
+        let gossip: Arc<Mutex<Option<GossipHandle>>> = Arc::new(Mutex::new(None));
         let handler = MeshHttpProxyHandler::new(
             allowlist.clone(),
             apps.clone(),
             membership.clone(),
             registrations.clone(),
         );
-        let membership_handler = MembershipSyncHandler::new(membership.clone());
+        let membership_handler = MembershipSyncHandler::new(membership.clone(), gossip.clone());
 
         let mut node = P2pNode::builder(identity.secret_key_bytes(), &relays, allowlist.clone())
             .mdns_service_name(MDNS_SERVICE_NAME)
@@ -232,7 +233,6 @@ impl MeshDaemon {
 
         let node = Arc::new(node);
         let pending_pairing: Arc<Mutex<Option<PendingPairing>>> = Arc::new(Mutex::new(None));
-        let gossip: Arc<Mutex<Option<GossipHandle>>> = Arc::new(Mutex::new(None));
         let device_name = cfg.device_name.clone();
         let notes_health_url = cfg.notes_health_url.clone();
         let relay_listen = cfg.relay_listen;
@@ -255,7 +255,8 @@ impl MeshDaemon {
                             let peer_id = exchange.remote_id;
                             // S2: reject a revoked peer before consuming the code.
                             let peers = allowlist.list_peers().await.unwrap_or_default();
-                            if peers.iter().any(|p| p.node_id == peer_id && p.removed) {
+                            let revoked = membership.evaluate().await.revoked.contains_key(&peer_id);
+                            if revoked || peers.iter().any(|p| p.node_id == peer_id && p.removed) {
                                 tracing::warn!(peer = %peer_id, "rejecting inbound pairing from revoked peer");
                                 drop(exchange.reply_tx);
                                 continue;
@@ -402,6 +403,11 @@ impl MeshDaemon {
             while let Some(ev) = sub.recv().await {
                 match ev {
                     GossipEvent::Data { bytes, from } => {
+                        // B1.4 / S3: drop frames from a peer that is no longer
+                        // active (a just-revoked peer may still be in the swarm).
+                        if !membership.is_active(&from).await {
+                            continue;
+                        }
                         // Compact frames first, then a bare poke for compatibility.
                         let parsed = match serde_json::from_slice::<MeshWireMessage>(&bytes) {
                             Ok(msg) => Some(msg),

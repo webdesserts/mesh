@@ -15,7 +15,10 @@ use p2p_core::membership::{
 };
 use p2p_core::protocol::{AcceptError, ProtocolHandler};
 use p2p_core::streams::{read_length_prefixed, write_length_prefixed};
+use bytes::Bytes;
+use p2p_core::gossip::GossipHandle;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use crate::membership_store::MembershipStore;
 use crate::poke::MeshPokeWire;
@@ -71,14 +74,43 @@ pub enum MeshWireMessage {
 }
 
 /// Server side of `ALPN_MEMBERSHIP`.
-#[derive(Debug)]
 pub struct MembershipSyncHandler {
     store: Arc<MembershipStore>,
+    gossip: Arc<Mutex<Option<GossipHandle>>>,
+}
+
+// `GossipHandle` is not `Debug`; render only the store so logs stay useful.
+impl std::fmt::Debug for MembershipSyncHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MembershipSyncHandler")
+            .field("store", &self.store)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MembershipSyncHandler {
-    pub fn new(store: Arc<MembershipStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<MembershipStore>, gossip: Arc<Mutex<Option<GossipHandle>>>) -> Self {
+        Self { store, gossip }
+    }
+
+    /// Announce our current heads so neighbors already connected pull the
+    /// entries a fresh pairing just added (`NeighborUp` fired long ago).
+    async fn broadcast_heads(&self) {
+        let log = self.store.log_snapshot().await;
+        let wire = MeshWireMessage::AntiEntropy {
+            mesh_id: log.mesh_id.clone(),
+            heads: log.evaluate().heads,
+        };
+        let bytes = match serde_json::to_vec(&wire) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let guard = self.gossip.lock().await;
+        if let Some(h) = guard.as_ref() {
+            if let Err(e) = h.broadcast(Bytes::from(bytes)).await {
+                tracing::warn!(error = %e, "membership anti-entropy broadcast failed");
+            }
+        }
     }
 
     async fn write_resp(&self, send: &mut SendStream, resp: &MembershipWireResp) -> Result<()> {
@@ -215,6 +247,7 @@ impl MembershipSyncHandler {
                 };
             }
             self.store.clear_pending(&initiator_id).await;
+            self.broadcast_heads().await;
             return MembershipWireResp::PairSync {
                 canonical_log: adopted,
             };
@@ -266,6 +299,7 @@ impl MembershipSyncHandler {
                 }
             }
             self.store.clear_pending(&initiator_id).await;
+            self.broadcast_heads().await;
             return MembershipWireResp::PairSync {
                 canonical_log: self.store.log_snapshot().await,
             };
@@ -293,6 +327,7 @@ impl MembershipSyncHandler {
             }
         }
         self.store.clear_pending(&initiator_id).await;
+        self.broadcast_heads().await;
         MembershipWireResp::PairSync {
             canonical_log: self.store.log_snapshot().await,
         }

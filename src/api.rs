@@ -106,6 +106,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/revoke", post(revoke))
         .route("/apps/register", post(apps_register))
         .route("/apps/unregister", post(apps_unregister))
+        .route("/register", post(apps_register))
         .layer(axum::middleware::from_fn(csrf_guard))
         .with_state(state)
 }
@@ -135,6 +136,7 @@ fn is_mutating_management(method: &axum::http::Method, path: &str) -> bool {
             | "/revoke"
             | "/apps/register"
             | "/apps/unregister"
+            | "/register"
     )
 }
 
@@ -515,6 +517,17 @@ async fn pair(State(st): State<Arc<ApiState>>, Json(req): Json<PairReq>) -> Resp
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
+    // S1c: a peer revoked in the signed log must fail closed before dialing,
+    // otherwise the membership gate refuses the PAKE dial and we report 502.
+    if st.membership.evaluate().await.revoked.contains_key(&peer) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "peer key is revoked in membership log; rotate key first"
+            })),
+        )
+            .into_response();
+    }
     // Our own configured device name is authoritative on the wire.
     let hello = PairingHello {
         node_id: st.self_id,
@@ -597,11 +610,32 @@ async fn pair(State(st): State<Arc<ApiState>>, Json(req): Json<PairReq>) -> Resp
                     if let Err(e) = h.rejoin_peers(vec![peer]).await {
                         tracing::warn!(peer = %peer, error = %e, "rejoin_peers after outbound pair failed");
                     }
+                    // Announce our heads so already-connected neighbors pull the
+                    // entries this pairing just added (NeighborUp fired earlier).
+                    let log = st.membership.log_snapshot().await;
+                    let wire = MeshWireMessage::AntiEntropy {
+                        mesh_id: log.mesh_id.clone(),
+                        heads: log.evaluate().heads,
+                    };
+                    if let Ok(bytes) = serde_json::to_vec(&wire) {
+                        if let Err(e) = h.broadcast(Bytes::from(bytes)).await {
+                            tracing::warn!(error = %e, "pair anti-entropy broadcast failed");
+                        }
+                    }
                 }
             }
             Json(res).into_response()
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+        Err(e) => {
+            // S1c: any failure of the signed membership handshake is a
+            // membership refusal (revoked / not allowlisted / mesh mismatch),
+            // so report 409 Conflict rather than a transport-level 502.
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
     }
 }
 
