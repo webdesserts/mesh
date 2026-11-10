@@ -571,6 +571,14 @@ async fn pair(State(st): State<Arc<ApiState>>, Json(req): Json<PairReq>) -> Resp
                         let hex = peer.to_string();
                         format!("peer-{}", &hex[..8.min(hex.len())])
                     });
+                for r in &st.relays {
+                    st.node.add_peer_relay(peer, r);
+                }
+                for url in &res.relay_urls {
+                    if let Ok(r) = RelayAddr::parse(url) {
+                        st.node.add_peer_relay(peer, &r);
+                    }
+                }
                 // S1a: record an in-memory pending grant, then run the signed
                 // membership handshake. `allowlist.json` is never written here.
                 st.membership.grant_pending(peer, desired.clone()).await;
@@ -595,14 +603,6 @@ async fn pair(State(st): State<Arc<ApiState>>, Json(req): Json<PairReq>) -> Resp
                             Json(serde_json::json!({ "error": e.to_string() })),
                         )
                             .into_response();
-                    }
-                }
-                for r in &st.relays {
-                    st.node.add_peer_relay(peer, r);
-                }
-                for url in &res.relay_urls {
-                    if let Ok(r) = RelayAddr::parse(url) {
-                        st.node.add_peer_relay(peer, &r);
                     }
                 }
                 let guard = st.gossip.lock().await;

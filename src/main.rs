@@ -111,8 +111,11 @@ async fn main() -> Result<()> {
                 "code": code,
                 "peer_device_name": peer_device_name,
             });
+            let token = std::fs::read_to_string(&paths.admin_token)
+                .with_context(|| format!("read {}", paths.admin_token.display()))?;
             let resp = reqwest::Client::new()
                 .post(format!("{base}/pair"))
+                .bearer_auth(token.trim())
                 .json(&body)
                 .send()
                 .await
