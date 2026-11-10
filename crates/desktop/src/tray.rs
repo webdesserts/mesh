@@ -7,6 +7,7 @@ use crate::state::AppState;
 use tauri::menu::{CheckMenuItemBuilder, IsMenuItem, Menu, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry};
+use tauri_plugin_autostart::ManagerExt;
 
 /// Tray id used by `app.tray_by_id`.
 pub const TRAY_ID: &str = "main";
@@ -157,6 +158,15 @@ fn menu_for(
     let toggle_item = CheckMenuItemBuilder::with_id("toggle_relay", "Host Relay (:3340)")
         .checked(relay_bind.is_some())
         .build(app)?;
+    let restart_item = MenuItemBuilder::with_id("restart_daemon", "Restart Daemon").build(app)?;
+    let updates_item = MenuItemBuilder::with_id("check_updates", "Check for Updates…").build(app)?;
+    let autostart_on = app
+        .autolaunch()
+        .is_enabled()
+        .unwrap_or(false);
+    let autostart_item = CheckMenuItemBuilder::with_id("toggle_autostart", "Launch at Login")
+        .checked(autostart_on)
+        .build(app)?;
     let quit_item = MenuItemBuilder::with_id("quit", "Quit Mesh").build(app)?;
 
     let sep1 = PredefinedMenuItem::separator(app)?;
@@ -172,6 +182,9 @@ fn menu_for(
     refs.push(&copy_item);
     refs.push(&toggle_item);
     refs.push(&sep3);
+    refs.push(&restart_item);
+    refs.push(&updates_item);
+    refs.push(&autostart_item);
     refs.push(&quit_item);
     Menu::with_items(app, &refs)
 }

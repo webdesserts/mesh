@@ -3,6 +3,7 @@
 
 mod api_client;
 mod commands;
+mod control;
 mod daemon_host;
 mod menu_events;
 mod pair_window;
@@ -17,6 +18,8 @@ use state::AppState;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::Manager;
+use tauri_plugin_autostart::ManagerExt;
+use webdesserts_mesh::api;
 use webdesserts_mesh::config::{MeshConfig, MeshPaths};
 
 /// Resolve the mesh data directory: `MESH_DIR` override, else the default
@@ -89,6 +92,11 @@ fn main() -> Result<()> {
     let cfg = ensure_default_config(&paths)?;
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::daemon_snapshot,
             commands::generate_pair_code,
@@ -101,6 +109,11 @@ fn main() -> Result<()> {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            // Launch at Login: enable on first run, then report the live state
+            // through `GET /status` (`autostart_enabled`).
+            let _ = app.autolaunch().enable();
+            api::set_autostart_enabled(app.autolaunch().is_enabled().ok());
+
             let handle = app.handle().clone();
             let paths = paths.clone();
             let cfg = cfg.clone();
@@ -111,8 +124,9 @@ fn main() -> Result<()> {
             // first menu already shows real status.
             let start_paths = paths.clone();
             let start_cfg = cfg.clone();
+            let control_router = control::router(handle.clone());
             let host = tauri::async_runtime::block_on(async move {
-                let host = DaemonHost::start(start_paths, start_cfg).await?;
+                let host = DaemonHost::start(start_paths, start_cfg, control_router).await?;
                 let token = api_client::read_admin_token(&token_path).ok();
                 Ok::<_, anyhow::Error>((host, token))
             })?;

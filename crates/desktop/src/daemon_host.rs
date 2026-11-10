@@ -8,6 +8,7 @@
 
 use crate::api_client;
 use anyhow::{Context, Result};
+use axum::Router;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use webdesserts_mesh::MeshDaemon;
@@ -41,7 +42,7 @@ pub struct DaemonHost {
 impl DaemonHost {
     /// Attach to an existing daemon if `listen_addr` already answers, otherwise
     /// start one in-process and serve its API.
-    pub async fn start(paths: MeshPaths, cfg: MeshConfig) -> Result<Self> {
+    pub async fn start(paths: MeshPaths, cfg: MeshConfig, extra: Router) -> Result<Self> {
         let (shutdown, rx) = watch::channel(false);
         let base = api_client::base_url(&cfg.listen_addr);
 
@@ -69,7 +70,7 @@ impl DaemonHost {
         let mut tcp_rx = rx.clone();
         tokio::spawn(async move {
             tokio::select! {
-                result = api::serve(tcp_state, &listen_addr) => {
+                result = api::serve_with_extra(tcp_state, &listen_addr, extra) => {
                     if let Err(e) = result {
                         tracing::warn!(error = %e, "mesh TCP API stopped");
                     }

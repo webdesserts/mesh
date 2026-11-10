@@ -62,7 +62,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.cask.count('secrets.HOMEBREW_TAP_TOKEN'), 1)
         self.assertLess(self.publish.index("'--operation', 'check-queue'"), self.publish.index('repository: webdesserts/homebrew-tap'))
         self.assertIn("'--operation', 'publish', '--run-id', os.environ['GITHUB_RUN_ID']", self.publish)
-        self.assertIn("'--signer-config', 'scripts/t299/signer_config.json'", self.publish)
+        self.assertIn("'--signer-config', 'tooling/scripts/t299/signer_config.json'", self.publish)
         self.assertNotIn("'--signer-config'", self.verify)
         self.assertIn('prevent NEW release OR desktop publication runs until this job completes', self.publish)
         self.assertNotIn('concurrency:', self.cask)

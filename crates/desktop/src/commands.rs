@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_updater::UpdaterExt;
 
 /// `GET /status` + `GET /membership` for the pairing window.
 pub async fn snapshot(state: &AppState) -> Result<Value> {
@@ -127,13 +128,45 @@ pub async fn toggle_relay(app: &AppHandle) -> Result<bool> {
     if let Some(host) = host {
         host.shutdown().await;
         let restarted = Arc::new(
-            DaemonHost::start(state.paths.clone(), cfg)
+            DaemonHost::start(state.paths.clone(), cfg, crate::control::router(app.clone()))
                 .await
                 .context("restart mesh daemon")?,
         );
         *state.host.lock().await = Some(restarted);
     }
     Ok(hosting)
+}
+
+/// Check for a newer Mesh release; returns the latest version when one exists.
+pub async fn check_updates(app: &AppHandle) -> Result<Option<String>> {
+    let updater = app.updater().context("updater unavailable")?;
+    let update = updater.check().await.context("check for updates")?;
+    Ok(update.map(|u| u.version))
+}
+
+/// Restart the in-process daemon after reloading `config.toml` from disk.
+///
+/// Shared by the tray `Restart Daemon` item and `POST /daemon/restart`.
+pub async fn restart_daemon(app: &AppHandle) -> Result<()> {
+    let state = app.state::<AppState>();
+    let cfg = state.paths.load_config().context("reload config.toml")?;
+    cfg.validate().context("validate mesh config")?;
+    *state.cfg.lock().await = cfg.clone();
+
+    let host = {
+        let mut guard = state.host.lock().await;
+        guard.take()
+    };
+    if let Some(host) = host {
+        host.shutdown().await;
+    }
+    let restarted = Arc::new(
+        DaemonHost::start(state.paths.clone(), cfg, crate::control::router(app.clone()))
+            .await
+            .context("restart mesh daemon")?,
+    );
+    *state.host.lock().await = Some(restarted);
+    Ok(())
 }
 
 #[tauri::command]

@@ -28,6 +28,35 @@ use tokio::sync::Mutex;
 
 use std::collections::BTreeMap;
 
+/// Launch-at-Login state reported by `GET /status`.
+///
+/// `-1` = unknown (external daemon), `0` = disabled, `1` = enabled. Set by
+/// `Mesh.app` through [`set_autostart_enabled`]; the app and the in-process
+/// daemon share one process, so a plain atomic is enough.
+static AUTOSTART_ENABLED: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Record the Launch-at-Login state for `GET /status`.
+pub fn set_autostart_enabled(enabled: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    AUTOSTART_ENABLED.store(
+        match enabled {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+fn autostart_enabled() -> Option<bool> {
+    use std::sync::atomic::Ordering;
+    match AUTOSTART_ENABLED.load(Ordering::Relaxed) {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    }
+}
+
 use crate::config::AppTargetConfig;
 use crate::membership_store::MembershipStore;
 use crate::membership_sync::MeshWireMessage;
@@ -137,6 +166,9 @@ fn is_mutating_management(method: &axum::http::Method, path: &str) -> bool {
             | "/apps/register"
             | "/apps/unregister"
             | "/register"
+            | "/daemon/restart"
+            | "/app/restart"
+            | "/app/update"
     )
 }
 
@@ -167,6 +199,27 @@ pub async fn serve(state: Arc<ApiState>, addr: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Bind and serve the TCP API with desktop-only control routes merged in.
+///
+/// `extra` carries routes that need the Tauri `AppHandle` (`/daemon/restart`,
+/// `/app/restart`, `/update/check`, `/app/update`). They are merged **before**
+/// `admin_guard` is layered, so every mutating desktop route still requires the
+/// admin bearer token over loopback TCP.
+pub async fn serve_with_extra(
+    state: Arc<ApiState>,
+    addr: &str,
+    extra: Router,
+) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let guard_state = state.clone();
+    let merged = router(state)
+        .merge(extra)
+        .layer(axum::middleware::from_fn(csrf_guard))
+        .layer(axum::middleware::from_fn_with_state(guard_state, admin_guard));
+    axum::serve(listener, merged).await?;
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct StatusResp {
     device_name: String,
@@ -179,6 +232,9 @@ struct StatusResp {
     latest_poke_seq: u64,
     notes_sync_healthy: bool,
     mesh_id: String,
+    version: String,
+    pid: u32,
+    autostart_enabled: Option<bool>,
 }
 
 /// Probe `NotesSync.app`'"'"'s loopback health endpoint with a 500ms timeout.
@@ -209,6 +265,9 @@ async fn status(State(st): State<Arc<ApiState>>) -> Response {
         poke_epoch: st.inbox.epoch(),
         latest_poke_seq: st.inbox.latest_seq(),
         notes_sync_healthy: healthy,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        pid: std::process::id(),
+        autostart_enabled: autostart_enabled(),
     })
     .into_response()
 }
