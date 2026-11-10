@@ -21,6 +21,7 @@ from artifact_validator import ValidationError, digest, require, run
 REPOSITORY = 'webdesserts/mesh'
 TOKEN = 'mesh'
 TAP = 'webdesserts/tap'
+OFFICIAL_TAP = 'homebrew/cask'
 QUALIFIED = TAP + '/' + TOKEN
 CASK = 'Casks/' + TOKEN + '.rb'
 # Literal Homebrew interpolation, kept out of .format braces by concatenation.
@@ -203,8 +204,17 @@ def candidate_gates(tap, tag, sha256, runner):
             own = checked(runner, ['brew', 'info', '--json=v2', '--cask', TOKEN], env=env)
             try:
                 matches = json.loads(own)['casks']
-                require(len(matches) == 1 and matches[0]['full_token'] == QUALIFIED and
-                        resolved_cask_source_path(matches[0]['ruby_source_path'], tap) == path.resolve(), 'unqualified token resolves elsewhere')
+                require(len(matches) == 1, 'invalid collision resolution')
+                resolved = matches[0]
+                # An official Homebrew cask may legitimately own the bare token
+                # (e.g. homebrew/cask/mesh); we always install via QUALIFIED, so
+                # that shadowing is expected and not a failure. Any other tap
+                # resolving the bare token must be our own qualified cask.
+                if resolved['tap'] == OFFICIAL_TAP:
+                    require(resolved['token'] == TOKEN, 'invalid official collision resolution')
+                else:
+                    require(resolved['full_token'] == QUALIFIED and
+                            resolved_cask_source_path(resolved['ruby_source_path'], tap) == path.resolve(), 'unqualified token resolves elsewhere')
             except (ValueError, KeyError, TypeError) as exc:
                 raise ValidationError('invalid collision resolution') from exc
         else:

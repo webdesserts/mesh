@@ -90,8 +90,8 @@ class CandidateTests(unittest.TestCase):
             if self.command_failure == 'resolution':
                 cask['ruby_source_path'] = '/wrong/cask.rb'
             if argv[-1] == gate.TOKEN and self.unqualified_info_override:
-                field, value = self.unqualified_info_override
-                cask[field] = value
+                for field, value in self.unqualified_info_override.items():
+                    cask[field] = value
             return result(json.dumps({'casks': [cask]}))
         if argv[:2] == ['brew', '--cache']:
             return result(str(self.cache) + '\n')
@@ -279,7 +279,7 @@ class CandidateTests(unittest.TestCase):
             ('ruby_source_path', str(self.root / 'foreign-cask.rb')),
         ]:
             start = len(self.calls)
-            self.unqualified_info_override = (field, value)
+            self.unqualified_info_override = {field: value}
             with self.subTest(field=field), self.assertRaises(gate.ValidationError):
                 self.validate()
             calls = self.calls[start:]
@@ -290,6 +290,12 @@ class CandidateTests(unittest.TestCase):
                                  and any(verb in argv for verb in ('add', 'commit', 'push'))
                                  for argv in calls))
             self.assert_no_staging()
+        self.unqualified_info_override = None
+
+    def test_official_cask_shadowing_bare_token_is_accepted(self):
+        self.search_output = (gate.TOKEN + '\n', '', 0)
+        self.unqualified_info_override = {'tap': 'homebrew/cask', 'full_token': gate.TOKEN}
+        self.assertEqual(self.validate()['status'], 'validated')
         self.unqualified_info_override = None
 
     def test_collision_search_accepts_only_exact_no_color_no_match(self):
