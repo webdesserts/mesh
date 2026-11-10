@@ -6,6 +6,7 @@ resolver = "2"
 name = "webdesserts-mesh"
 version = "0.3.0"
 edition = "2024"
+repository = "https://github.com/webdesserts/mesh"
 
 [dependencies]
 p2p-core = { git = "https://github.com/webdesserts/p2p-core.git", tag = "v0.1.6" }
