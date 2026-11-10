@@ -2589,8 +2589,8 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "p2p-core"
-version = "0.1.2"
-source = "git+https://github.com/webdesserts/p2p-core.git?tag=v0.1.2#bce5274b41eba94b8b2ec9da21ae6e77f1fe0bb8"
+version = "0.1.3"
+source = "git+https://github.com/webdesserts/p2p-core.git?tag=v0.1.3#2526a328003ed5f8dcf13823d703565ddf85cc76"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4453,13 +4453,14 @@ dependencies = [
 
 [[package]]
 name = "webdesserts-mesh"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
  "blake3",
  "bytes",
  "clap",
+ "data-encoding",
  "dirs",
  "futures",
  "iroh",
@@ -4468,6 +4469,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "toml 0.8.23",
  "tracing",

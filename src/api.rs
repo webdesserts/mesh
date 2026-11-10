@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -26,7 +26,13 @@ use p2p_core::relay_addr::RelayAddr;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use std::collections::BTreeMap;
+
 use crate::config::AppTargetConfig;
+use crate::membership_store::MembershipStore;
+use crate::membership_sync::MeshWireMessage;
+use crate::register::RegistrationStore;
+use p2p_core::membership::{Relationship, SignedMembershipEntry};
 use crate::poke::{MeshPokeWire, SharedPokeInbox, StoredPoke};
 use crate::proxy::{ConnPool, MAX_BODY_BYTES, ProxyRequest, forward_with_body};
 
@@ -50,6 +56,16 @@ pub struct ApiState {
     pub notes_health_url: String,
     /// Whether the daemon started an embedded relay.
     pub relay_listen: bool,
+    /// Signed membership log: the source of truth for the allowlist projection.
+    pub membership: Arc<MembershipStore>,
+    /// Dynamically registered apps + admin token.
+    pub registrations: Arc<RegistrationStore>,
+    /// Single shared health-probe client (500ms timeout).
+    pub health_client: reqwest::Client,
+    /// Loopback API port (reserved from dynamic app registration).
+    pub listen_port: u16,
+    /// Embedded relay port (reserved from dynamic app registration).
+    pub relay_port: u16,
 }
 
 /// CSRF guard: refuse any request with an `Origin` header or a non-loopback
@@ -84,14 +100,68 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/pokes", get(pokes))
         .route("/pair", post(pair))
         .route("/pair/code", post(pair_code))
+        .route("/membership", get(membership_get))
+        .route("/membership/remove", post(membership_remove))
+        .route("/membership/genesis", post(membership_genesis))
+        .route("/revoke", post(revoke))
+        .route("/apps/register", post(apps_register))
+        .route("/apps/unregister", post(apps_unregister))
         .layer(axum::middleware::from_fn(csrf_guard))
         .with_state(state)
+}
+
+/// TCP router: mutating management routes additionally require the admin token
+/// (Colima containers can reach host `127.0.0.1:4620` via `host.docker.internal`).
+pub fn tcp_router(state: Arc<ApiState>) -> Router {
+    let guard_state = state.clone();
+    router(state).layer(axum::middleware::from_fn_with_state(
+        guard_state,
+        admin_guard,
+    ))
+}
+
+/// Mutating management routes that require `Authorization: Bearer <admin.token>`
+/// when reached over loopback TCP.
+fn is_mutating_management(method: &axum::http::Method, path: &str) -> bool {
+    if method != axum::http::Method::POST {
+        return false;
+    }
+    matches!(
+        path,
+        "/pair"
+            | "/pair/code"
+            | "/membership/remove"
+            | "/membership/genesis"
+            | "/revoke"
+            | "/apps/register"
+            | "/apps/unregister"
+    )
+}
+
+/// Admin-token guard for mutating management routes over TCP.
+pub async fn admin_guard(
+    State(st): State<Arc<ApiState>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if is_mutating_management(req.method(), req.uri().path()) {
+        let presented = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !st.registrations.admin_token_matches(presented) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    Ok(next.run(req).await)
 }
 
 /// Bind and serve until cancelled.
 pub async fn serve(state: Arc<ApiState>, addr: &str) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router(state)).await?;
+    axum::serve(listener, tcp_router(state)).await?;
     Ok(())
 }
 
@@ -106,17 +176,11 @@ struct StatusResp {
     poke_epoch: u64,
     latest_poke_seq: u64,
     notes_sync_healthy: bool,
+    mesh_id: String,
 }
 
 /// Probe `NotesSync.app`'"'"'s loopback health endpoint with a 500ms timeout.
-async fn notes_sync_healthy(url: &str) -> bool {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(500))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+async fn notes_sync_healthy(client: &reqwest::Client, url: &str) -> bool {
     match client.get(url).send().await {
         Ok(resp) => resp.status().is_success(),
         Err(_) => false,
@@ -125,12 +189,19 @@ async fn notes_sync_healthy(url: &str) -> bool {
 
 async fn status(State(st): State<Arc<ApiState>>) -> Response {
     let peers = st.allowlist.list_peers().await.map(|p| p.len()).unwrap_or(0);
-    let healthy = notes_sync_healthy(&st.notes_health_url).await;
+    let healthy = notes_sync_healthy(&st.health_client, &st.notes_health_url).await;
+    let mut apps: Vec<String> = st.apps.keys().cloned().collect();
+    for name in st.registrations.snapshot().await.apps.keys() {
+        if !apps.contains(name) {
+            apps.push(name.clone());
+        }
+    }
     Json(StatusResp {
         device_name: st.device_name.clone(),
         peer_id: st.self_id.to_string(),
         listen_addr: crate::config::DEFAULT_LISTEN_ADDR.to_string(),
-        apps: st.apps.keys().cloned().collect(),
+        apps,
+        mesh_id: st.membership.mesh_id().await,
         peers,
         relay_listen: st.relay_listen,
         poke_epoch: st.inbox.epoch(),
@@ -159,6 +230,27 @@ async fn resolve_target(st: &ApiState, target: &str) -> Result<PeerId, StatusCod
 }
 
 /// Forward one request to the target peer app over the mesh proxy ALPN.
+/// App-scoped bearer token (S4): a dynamically registered app must present
+/// `Authorization: Bearer <token>` (or the admin token) on `/poke`, `/pokes`,
+/// and `/peer/.../app/...`. Static `config.toml` apps stay loopback-trusted so
+/// existing Phase 2/3 callers are unchanged.
+async fn dynamic_app_token_ok(st: &ApiState, app_id: &str, headers: &HeaderMap) -> bool {
+    if st.apps.contains_key(app_id) {
+        return true;
+    }
+    if st.registrations.get(app_id).await.is_none() {
+        // Unknown app: let the handler produce its own 404.
+        return true;
+    }
+    let presented = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    st.registrations.verify_token(app_id, presented).await
+        || st.registrations.admin_token_matches(presented)
+}
+
 async fn proxy_inner(
     st: Arc<ApiState>,
     target: String,
@@ -172,6 +264,9 @@ async fn proxy_inner(
     };
 
     let (parts, body) = req.into_parts();
+    if !dynamic_app_token_ok(&st, &app_id, &parts.headers).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let body_bytes = match to_bytes(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -243,7 +338,14 @@ struct PokeReq {
 }
 
 /// Broadcast a poke. `seq` is receiver-local, so the sender returns no seq.
-async fn poke(State(st): State<Arc<ApiState>>, Json(req): Json<PokeReq>) -> Response {
+async fn poke(
+    State(st): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Json(req): Json<PokeReq>,
+) -> Response {
+    if !dynamic_app_token_ok(&st, &req.app_id, &headers).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let wire = MeshPokeWire {
         app_id: req.app_id,
         topic: req.topic,
@@ -321,7 +423,16 @@ fn pokes_resp(st: &ApiState, truncated: bool, pokes: Vec<StoredPoke>) -> Respons
 /// second `GET /pokes` is not left waiting until `timeout_ms`. The effective
 /// `since` (0 after a restart/eviction) drives both the first read and the
 /// long-poll wake check.
-async fn pokes(State(st): State<Arc<ApiState>>, Query(q): Query<PokesQuery>) -> Response {
+async fn pokes(
+    State(st): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Query(q): Query<PokesQuery>,
+) -> Response {
+    if let Some(app_id) = q.app_id.as_deref() {
+        if !dynamic_app_token_ok(&st, app_id, &headers).await {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_millis(q.timeout_ms.min(30_000));
     let mut rx = st.inbox.subscribe();
@@ -447,10 +558,25 @@ async fn pair(State(st): State<Arc<ApiState>>, Json(req): Json<PairReq>) -> Resp
                         let hex = peer.to_string();
                         format!("peer-{}", &hex[..8.min(hex.len())])
                     });
-                match crate::add_or_update_peer_unique(&st.allowlist, peer, &desired).await {
-                    Ok(name) => tracing::info!(peer = %peer, name = %name, "mesh pairing completed"),
+                // S1a: record an in-memory pending grant, then run the signed
+                // membership handshake. `allowlist.json` is never written here.
+                st.membership.grant_pending(peer, desired.clone()).await;
+                match crate::membership_sync::pair_sync_initiator(
+                    &st.node,
+                    peer,
+                    &st.membership,
+                    &desired,
+                )
+                .await
+                {
+                    Ok(log) => tracing::info!(
+                        peer = %peer,
+                        entries = log.entries.len(),
+                        "mesh pairing completed (signed membership)"
+                    ),
                     Err(e) => {
-                        tracing::warn!(peer = %peer, error = %e, "persist paired peer failed");
+                        st.membership.clear_pending(&peer).await;
+                        tracing::warn!(peer = %peer, error = %e, "membership pair sync failed");
                         return (
                             StatusCode::CONFLICT,
                             Json(serde_json::json!({ "error": e.to_string() })),
@@ -477,4 +603,273 @@ async fn pair(State(st): State<Arc<ApiState>>, Json(req): Json<PairReq>) -> Resp
         }
         Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Membership management (signed log is the source of truth)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MembershipRemoveReq {
+    peer: String,
+}
+
+#[derive(Deserialize)]
+struct MembershipGenesisReq {
+    #[serde(default)]
+    force: bool,
+}
+
+/// Resolve a `PeerId` (64-char hex) or a case-insensitive `device_name`.
+async fn resolve_peer(st: &ApiState, target: &str) -> Option<PeerId> {
+    if let Ok(id) = target.parse::<PeerId>() {
+        return Some(id);
+    }
+    let eval = st.membership.evaluate().await;
+    eval.active
+        .values()
+        .find(|m| m.device_name.eq_ignore_ascii_case(target))
+        .map(|m| m.peer_id)
+}
+
+/// Full revocation teardown (S3): allowlist projection is already rewritten by
+/// the store; here we drop pooled connections, relay hints, and gossip peers.
+async fn teardown_revoked(st: &ApiState, revoked: &[PeerId]) {
+    if revoked.is_empty() {
+        return;
+    }
+    {
+        let mut pool = st.pool.lock().await;
+        for peer in revoked {
+            pool.remove(peer);
+        }
+    }
+    for peer in revoked {
+        st.node.remove_peer_relay(*peer);
+    }
+    let active = st.membership.active_peer_ids().await;
+    let guard = st.gossip.lock().await;
+    if let Some(h) = guard.as_ref() {
+        if let Err(e) = h.rejoin_peers(active).await {
+            tracing::warn!(error = %e, "gossip rejoin after revocation failed");
+        }
+    }
+}
+
+/// Broadcast a signed membership entry on gossip.
+async fn broadcast_entry(st: &ApiState, entry: &SignedMembershipEntry) {
+    let wire = MeshWireMessage::Membership(entry.clone());
+    let bytes = match serde_json::to_vec(&wire) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let guard = st.gossip.lock().await;
+    if let Some(h) = guard.as_ref() {
+        if let Err(e) = h.broadcast(Bytes::from(bytes)).await {
+            tracing::warn!(error = %e, "membership gossip broadcast failed");
+        }
+    }
+}
+
+async fn membership_get(State(st): State<Arc<ApiState>>) -> Response {
+    let eval = st.membership.evaluate().await;
+    let log = st.membership.log_snapshot().await;
+    let active_peers: Vec<serde_json::Value> = eval
+        .active
+        .values()
+        .map(|m| {
+            serde_json::json!({
+                "peer_id": m.peer_id.to_string(),
+                "device_name": m.device_name,
+                "relationship": match m.relationship {
+                    Relationship::SelfDevice => "self",
+                    Relationship::Friend => "friend",
+                },
+                "paired_at": m.paired_at,
+            })
+        })
+        .collect();
+    let revoked_peers: Vec<serde_json::Value> = eval
+        .revoked
+        .iter()
+        .map(|(id, at)| serde_json::json!({ "peer_id": id.to_string(), "removed_at": at }))
+        .collect();
+    Json(serde_json::json!({
+        "mesh_id": eval.mesh_id,
+        "heads": eval.heads,
+        "active_peers": active_peers,
+        "revoked_peers": revoked_peers,
+        "entries_count": log.entries.len(),
+    }))
+    .into_response()
+}
+
+async fn membership_remove(
+    State(st): State<Arc<ApiState>>,
+    Json(req): Json<MembershipRemoveReq>,
+) -> Response {
+    let target = match resolve_peer(&st, &req.peer).await {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "unknown peer" })),
+            )
+                .into_response();
+        }
+    };
+    let entry = match st.membership.sign_remove(target).await {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = st.membership.append_entry(entry.clone()).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response();
+    }
+    teardown_revoked(&st, &[target]).await;
+    broadcast_entry(&st, &entry).await;
+    Json(serde_json::json!({ "ok": true, "revoked": target.to_string() })).into_response()
+}
+
+async fn revoke(
+    State(st): State<Arc<ApiState>>,
+    Json(req): Json<MembershipRemoveReq>,
+) -> Response {
+    membership_remove(State(st), Json(req)).await
+}
+
+async fn membership_genesis(
+    State(st): State<Arc<ApiState>>,
+    Json(req): Json<MembershipGenesisReq>,
+) -> Response {
+    let eval = st.membership.evaluate().await;
+    let self_active = eval.active.contains_key(&st.self_id);
+    if self_active && !req.force {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "this device is still active; pass force=true to re-genesis"
+            })),
+        )
+            .into_response();
+    }
+    if req.force && self_active {
+        // Announce the self-removal into the old mesh before abandoning it.
+        if let Ok(entry) = st.membership.sign_remove(st.self_id).await {
+            let _ = st.membership.append_entry(entry.clone()).await;
+            broadcast_entry(&st, &entry).await;
+        }
+    }
+    if let Err(e) = st.membership.reset_to_genesis().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response();
+    }
+    let mesh_id = st.membership.mesh_id().await;
+    Json(serde_json::json!({ "ok": true, "mesh_id": mesh_id })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic app registration (register.sock / admin-token TCP)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AppRegisterReq {
+    app_id: String,
+    port: u16,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    allow_friends: bool,
+}
+
+#[derive(Deserialize)]
+struct AppUnregisterReq {
+    app_id: String,
+}
+
+fn bearer_of(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
+}
+
+async fn apps_register(
+    State(st): State<Arc<ApiState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<AppRegisterReq>,
+) -> Response {
+    let static_apps: BTreeMap<String, AppTargetConfig> =
+        st.apps.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let reserved = vec![st.listen_port, st.relay_port];
+    let token = bearer_of(&headers);
+    match st
+        .registrations
+        .register(
+            &req.app_id,
+            req.port,
+            req.read_only,
+            req.allow_friends,
+            &static_apps,
+            &reserved,
+            token.as_deref(),
+        )
+        .await
+    {
+        Ok(token) => Json(serde_json::json!({
+            "status": "approved",
+            "app_id": req.app_id,
+            "token": token,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn apps_unregister(
+    State(st): State<Arc<ApiState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<AppUnregisterReq>,
+) -> Response {
+    let token = bearer_of(&headers);
+    match st
+        .registrations
+        .unregister(&req.app_id, token.as_deref())
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Serve the management + registration API over the `0600` Unix domain socket.
+///
+/// Callers here are pre-authenticated by OS filesystem permissions, so mutating
+/// routes do not need the admin bearer token.
+pub async fn serve_uds(state: Arc<ApiState>, path: std::path::PathBuf) -> anyhow::Result<()> {
+    let listener = crate::register::bind_register_sock(&path)?;
+    axum::serve(listener, router(state)).await?;
+    Ok(())
 }

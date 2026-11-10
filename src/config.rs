@@ -43,6 +43,9 @@ pub struct AppTargetConfig {
     /// Read-only apps accept only `GET`/`HEAD` across the mesh (e.g. `notes`).
     #[serde(default)]
     pub read_only: bool,
+    /// Whether a `Friend` peer may reach this app (default: no).
+    #[serde(default)]
+    pub allow_friends: bool,
 }
 
 impl AppTargetConfig {
@@ -51,6 +54,7 @@ impl AppTargetConfig {
             port: Some(port),
             base_url: None,
             read_only: false,
+            allow_friends: false,
         }
     }
 
@@ -59,6 +63,7 @@ impl AppTargetConfig {
             port: Some(port),
             base_url: None,
             read_only: true,
+            allow_friends: false,
         }
     }
 
@@ -67,6 +72,7 @@ impl AppTargetConfig {
             port: None,
             base_url: Some(base_url.into()),
             read_only: false,
+            allow_friends: false,
         }
     }
 
@@ -164,6 +170,14 @@ pub struct MeshPaths {
     pub lock: PathBuf,
     pub allowlist: PathBuf,
     pub config: PathBuf,
+    /// Signed membership log (source of truth for the allowlist projection).
+    pub membership: PathBuf,
+    /// Unix domain socket for local app registration (mode 0600).
+    pub register_sock: PathBuf,
+    /// Dynamically registered apps (token hashes only, mode 0600).
+    pub registrations: PathBuf,
+    /// Admin bearer token for mutating management routes over TCP (mode 0600).
+    pub admin_token: PathBuf,
 }
 
 impl MeshPaths {
@@ -174,6 +188,10 @@ impl MeshPaths {
             lock: dir.join("mesh.lock"),
             allowlist: dir.join("allowlist.json"),
             config: dir.join("config.toml"),
+            membership: dir.join("membership.json"),
+            register_sock: dir.join("register.sock"),
+            registrations: dir.join("registrations.json"),
+            admin_token: dir.join("admin.token"),
             dir,
         }
     }

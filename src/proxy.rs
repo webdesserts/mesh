@@ -24,6 +24,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::AppTargetConfig;
+use crate::membership_store::MembershipStore;
+use crate::register::RegistrationStore;
+use p2p_core::membership::Relationship;
 
 /// ALPN for the mesh HTTP proxy.
 pub const HTTP_PROXY_ALPN: &[u8] = b"webdesserts/mesh/http/1";
@@ -132,11 +135,20 @@ pub async fn dial_cached(pool: &ConnPool, node: &P2pNode, peer: PeerId) -> Resul
 pub struct MeshHttpProxyHandler<A: AllowlistStorage + Debug + 'static> {
     allowlist: Arc<A>,
     apps: Arc<HashMap<String, AppTargetConfig>>,
+    membership: Arc<MembershipStore>,
+    /// Dynamically registered apps (`register.sock`); consulted when `apps`
+    /// (static `config.toml`) has no entry for the requested `app_id`.
+    registrations: Arc<RegistrationStore>,
     client: reqwest::Client,
 }
 
 impl<A: AllowlistStorage + Debug + Send + Sync + 'static> MeshHttpProxyHandler<A> {
-    pub fn new(allowlist: Arc<A>, apps: Arc<HashMap<String, AppTargetConfig>>) -> Self {
+    pub fn new(
+        allowlist: Arc<A>,
+        apps: Arc<HashMap<String, AppTargetConfig>>,
+        membership: Arc<MembershipStore>,
+        registrations: Arc<RegistrationStore>,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(UPSTREAM_TIMEOUT)
@@ -145,17 +157,10 @@ impl<A: AllowlistStorage + Debug + Send + Sync + 'static> MeshHttpProxyHandler<A
         Self {
             allowlist,
             apps,
+            membership,
+            registrations,
             client,
         }
-    }
-
-    /// Device name recorded for `peer`, if paired.
-    async fn device_name(&self, peer: &PeerId) -> Option<String> {
-        let peers = self.allowlist.list_peers().await.ok()?;
-        peers
-            .into_iter()
-            .find(|p| &p.node_id == peer && !p.removed)
-            .map(|p| p.device_name)
     }
 
     /// Write a bare status response (no body) and finish the stream.
@@ -178,6 +183,16 @@ impl<A: AllowlistStorage + Debug + Send + Sync + 'static> MeshHttpProxyHandler<A
             .await
             .context("read request frame")?;
         let req: ProxyRequest = serde_json::from_slice(&meta).context("parse request frame")?;
+
+        // The signed membership log is authoritative: a peer that is not an
+        // active member (revoked, or never admitted) is refused here too.
+        let member = match self.membership.active_member(&peer).await {
+            Some(m) => m,
+            None => {
+                self.write_status(&mut send, 403).await?;
+                return Ok(());
+            }
+        };
 
         // Cap the declared body length before allocating anything.
         if req.body_len > MAX_BODY_BYTES as u64 {
@@ -203,13 +218,29 @@ impl<A: AllowlistStorage + Debug + Send + Sync + 'static> MeshHttpProxyHandler<A
             return Ok(());
         }
 
+        // Static `config.toml` apps win; otherwise fall back to a dynamically
+        // registered app (S5) so `register.sock` apps are reachable over the mesh.
         let target = match self.apps.get(&req.app_id) {
             Some(t) => t.clone(),
-            None => {
-                self.write_status(&mut send, 404).await?;
-                return Ok(());
-            }
+            None => match self.registrations.get(&req.app_id).await {
+                Some(reg) => AppTargetConfig {
+                    port: Some(reg.port),
+                    base_url: None,
+                    read_only: reg.read_only,
+                    allow_friends: reg.allow_friends,
+                },
+                None => {
+                    self.write_status(&mut send, 404).await?;
+                    return Ok(());
+                }
+            },
         };
+
+        // Friend isolation gate: a friend peer may only reach apps that opt in.
+        if member.relationship == Relationship::Friend && !target.allow_friends {
+            self.write_status(&mut send, 403).await?;
+            return Ok(());
+        }
         let port = match target.resolved_port() {
             Ok(p) => p,
             Err(_) => {
@@ -245,12 +276,14 @@ impl<A: AllowlistStorage + Debug + Send + Sync + 'static> MeshHttpProxyHandler<A
         // an inbound copy (spoof protection).
         // v0: all paired peers are self (every allowlisted peer is one of
         // Michael'"'"'s own devices). Revisit when sharing arrives.
-        let relationship = "self";
+        let relationship_str = match member.relationship {
+            Relationship::SelfDevice => "self",
+            Relationship::Friend => "friend",
+        };
         builder = builder.header("x-mesh-peer-id", peer.to_string());
-        builder = builder.header("x-mesh-relationship", relationship);
-        if let Some(name) = self.device_name(&peer).await {
-            builder = builder.header("x-mesh-device-name", name);
-        }
+        builder = builder.header("x-mesh-mesh-id", self.membership.mesh_id().await);
+        builder = builder.header("x-mesh-relationship", relationship_str);
+        builder = builder.header("x-mesh-device-name", member.device_name.clone());
 
         if !body.is_empty() {
             builder = builder.body(body);
@@ -320,7 +353,8 @@ impl<A: AllowlistStorage + Debug + Send + Sync + 'static> ProtocolHandler
 
             // C1(a): re-check the allowlist for EVERY bi-stream, not once per
             // connection. A revoked peer must not ride an already-open conn.
-            let allowed = self.allowlist.is_allowed(&peer).await.unwrap_or(false);
+            let allowed = self.allowlist.is_allowed(&peer).await.unwrap_or(false)
+                && self.membership.active_member(&peer).await.is_some();
             if !allowed {
                 connection.close(
                     VarInt::from_u32(NOT_IN_ALLOWLIST_CODE),

@@ -81,10 +81,20 @@ async fn main() -> Result<()> {
                 cfg
             };
             let listen = cfg.listen_addr.clone();
+            let register_sock = paths.register_sock.clone();
             let daemon = Arc::new(MeshDaemon::start(paths, cfg).await?);
             daemon.start_poke_gossip().await?;
             let state = daemon.api_state();
             tracing::info!(listen = %listen, peer = %daemon.self_id, "mesh daemon up");
+            // Local app registration socket (0600, pre-authenticated by OS perms).
+            let uds_state = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    webdesserts_mesh::api::serve_uds(uds_state, register_sock).await
+                {
+                    tracing::warn!(error = %e, "register.sock server failed");
+                }
+            });
             webdesserts_mesh::api::serve(state, &listen).await?;
             Ok(())
         }

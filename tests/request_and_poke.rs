@@ -30,6 +30,45 @@ use webdesserts_mesh::config::{AppTargetConfig, MeshConfig, MeshPaths};
 use webdesserts_mesh::poke::{MeshPokeWire, PokeInbox, poke_topic};
 use webdesserts_mesh::proxy::{HTTP_PROXY_ALPN, ProxyRequest, forward_with_body, new_pool, should_strip_header};
 
+/// A solo-Genesis membership store in its own temp dir. The proxy gate reads
+/// this log, so tests must sign peers in before they can be served.
+async fn test_membership(
+    tag: &str,
+    device_name: &str,
+) -> Arc<webdesserts_mesh::membership_store::MembershipStore> {
+    let dir = webdesserts_mesh::register::short_test_dir(tag);
+    let paths = MeshPaths::at(&dir);
+    paths.ensure_dir().expect("ensure membership dir");
+    let identity = Arc::new(
+        p2p_core::identity::IdentityKey::load_or_generate_at(&paths.key)
+            .await
+            .expect("identity"),
+    );
+    let allow = Arc::new(FileAllowlistStorage::at_path(dir.join("allowlist.json")));
+    Arc::new(
+        webdesserts_mesh::membership_store::MembershipStore::load_or_init(
+            identity,
+            paths,
+            allow,
+            device_name.to_string(),
+        )
+        .await
+        .expect("membership store"),
+    )
+}
+
+/// A registration store in its own temp dir.
+async fn test_registrations(tag: &str) -> Arc<webdesserts_mesh::register::RegistrationStore> {
+    let dir = webdesserts_mesh::register::short_test_dir(tag);
+    let paths = MeshPaths::at(&dir);
+    paths.ensure_dir().expect("ensure registrations dir");
+    Arc::new(
+        webdesserts_mesh::register::RegistrationStore::load_or_init(paths)
+            .await
+            .expect("registration store"),
+    )
+}
+
 fn seed(n: u8) -> [u8; 32] {
     [n; 32]
 }
@@ -95,7 +134,7 @@ async fn spawn_api(state: Arc<webdesserts_mesh::api::ApiState>) -> anyhow::Resul
     Ok(port)
 }
 
-fn api_state(
+async fn api_state(
     node: Arc<P2pNode>,
     allowlist: Arc<FileAllowlistStorage>,
     apps: Arc<HashMap<String, AppTargetConfig>>,
@@ -104,6 +143,32 @@ fn api_state(
     device_name: &str,
 ) -> Arc<webdesserts_mesh::api::ApiState> {
     let self_id = node.node_id();
+    // Membership + registrations live in their own temp dir so the projection
+    // never clobbers the caller'"'"'s allowlist fixture.
+    let dir = webdesserts_mesh::register::short_test_dir("api-state");
+    let paths = MeshPaths::at(&dir);
+    paths.ensure_dir().expect("ensure api-state dir");
+    let identity = Arc::new(
+        p2p_core::identity::IdentityKey::load_or_generate_at(&paths.key)
+            .await
+            .expect("identity"),
+    );
+    let mem_allowlist = Arc::new(FileAllowlistStorage::at_path(dir.join("allowlist.json")));
+    let membership = Arc::new(
+        webdesserts_mesh::membership_store::MembershipStore::load_or_init(
+            identity,
+            paths.clone(),
+            mem_allowlist,
+            device_name.to_string(),
+        )
+        .await
+        .expect("membership store"),
+    );
+    let registrations = Arc::new(
+        webdesserts_mesh::register::RegistrationStore::load_or_init(paths.clone())
+            .await
+            .expect("registration store"),
+    );
     Arc::new(webdesserts_mesh::api::ApiState {
         node,
         allowlist,
@@ -117,6 +182,11 @@ fn api_state(
         pending_pairing: Arc::new(Mutex::new(None)),
         notes_health_url: "http://127.0.0.1:8082/health".to_string(),
         relay_listen: false,
+        membership,
+        registrations,
+        health_client: reqwest::Client::new(),
+        listen_port: 0,
+        relay_port: 0,
     })
 }
 
@@ -189,7 +259,7 @@ async fn csrf_guard_refuses_origin_and_non_loopback_host() -> anyhow::Result<()>
         Arc::new(PokeInbox::new(8)),
         Arc::new(Mutex::new(None)),
         "umbra",
-    );
+    ).await;
     let port = spawn_api(state).await?;
 
     let client = reqwest::Client::new();
@@ -236,11 +306,18 @@ async fn e2e_request_resolves_device_name_and_rewrites_host() -> anyhow::Result<
     // umbra'"'"'s allowlist names rhea "rhea", so the injected device name is
     // "rhea" (spec §6.3).
     let umbra_allowlist = file_allowlist("umbra-e2e");
+    let umbra_membership = test_membership("umbra-e2e-mem", "umbra").await;
+    let umbra_regs = test_registrations("umbra-e2e-regs").await;
     let umbra = P2pNode::builder(seed(1), &[], umbra_allowlist.clone())
         .mdns_service_name("wd-mesh-test")
         .with_protocol(
             HTTP_PROXY_ALPN,
-            webdesserts_mesh::proxy::MeshHttpProxyHandler::new(umbra_allowlist.clone(), apps.clone()),
+            webdesserts_mesh::proxy::MeshHttpProxyHandler::new(
+                umbra_allowlist.clone(),
+                apps.clone(),
+                umbra_membership.clone(),
+                umbra_regs.clone(),
+            ),
         )
         .build()
         .await?;
@@ -256,6 +333,14 @@ async fn e2e_request_resolves_device_name_and_rewrites_host() -> anyhow::Result<
 
     umbra_allowlist.add_peer(rhea.node_id(), "rhea").await?;
     rhea_allowlist.add_peer(umbra.node_id(), "umbra").await?;
+    let add_rhea = umbra_membership
+        .sign_add(
+            rhea.node_id(),
+            "rhea",
+            p2p_core::membership::Relationship::SelfDevice,
+        )
+        .await?;
+    umbra_membership.append_entry(add_rhea).await?;
 
     let umbra_id = umbra.node_id();
     let rhea_id = rhea.node_id();
@@ -267,7 +352,7 @@ async fn e2e_request_resolves_device_name_and_rewrites_host() -> anyhow::Result<
         Arc::new(PokeInbox::new(8)),
         Arc::new(Mutex::new(None)),
         "umbra",
-    );
+    ).await;
     let api_port = spawn_api(state).await?;
 
     // `:target` is the device name "rhea"; the query string must survive.
@@ -356,11 +441,18 @@ async fn revoked_peer_is_refused_on_next_bi_stream_of_same_connection() -> anyho
     let apps = Arc::new(apps);
 
     let rhea_allowlist = file_allowlist("rhea-revoke");
+    let rhea_membership = test_membership("rhea-revoke-mem", "rhea").await;
+    let rhea_regs = test_registrations("rhea-revoke-regs").await;
     let rhea = P2pNode::builder(seed(4), &[], rhea_allowlist.clone())
         .mdns_service_name("wd-mesh-test")
         .with_protocol(
             HTTP_PROXY_ALPN,
-            webdesserts_mesh::proxy::MeshHttpProxyHandler::new(rhea_allowlist.clone(), apps.clone()),
+            webdesserts_mesh::proxy::MeshHttpProxyHandler::new(
+                rhea_allowlist.clone(),
+                apps.clone(),
+                rhea_membership.clone(),
+                rhea_regs.clone(),
+            ),
         )
         .build()
         .await?;
@@ -374,6 +466,14 @@ async fn revoked_peer_is_refused_on_next_bi_stream_of_same_connection() -> anyho
 
     umbra_allowlist.add_peer(rhea.node_id(), "rhea").await?;
     rhea_allowlist.add_peer(umbra.node_id(), "umbra").await?;
+    let add_umbra = rhea_membership
+        .sign_add(
+            umbra.node_id(),
+            "umbra",
+            p2p_core::membership::Relationship::SelfDevice,
+        )
+        .await?;
+    rhea_membership.append_entry(add_umbra).await?;
 
     let conn = umbra
         .connect(&PeerAddr::new(rhea.node_id()), HTTP_PROXY_ALPN)
@@ -395,8 +495,11 @@ async fn revoked_peer_is_refused_on_next_bi_stream_of_same_connection() -> anyho
     let resp: webdesserts_mesh::proxy::ProxyResponse = serde_json::from_slice(&meta)?;
     assert_eq!(resp.status, 200, "paired peer must be served");
 
-    // Revoke on the server side.
+    // Revoke on the server side: production does both (allowlist projection +
+    // signed log), so the test mirrors it.
     rhea_allowlist.remove_peer(&umbra.node_id()).await?;
+    let rm = rhea_membership.sign_remove(umbra.node_id()).await?;
+    rhea_membership.append_entry(rm).await?;
 
     // Second bi-stream on the SAME connection must be refused (C1(a)).
     let (mut send2, _recv2) = conn.open_bi().await?;
@@ -524,7 +627,7 @@ async fn two_concurrent_pollers_both_wake_on_one_poke() -> anyhow::Result<()> {
         inbox.clone(),
         Arc::new(Mutex::new(None)),
         "umbra",
-    );
+    ).await;
     let port = spawn_api(state).await?;
 
     let url = format!("http://127.0.0.1:{port}/pokes?appId=feeds&since=0&timeout_ms=5000");
@@ -672,7 +775,7 @@ async fn status_reports_phase3_fields() -> anyhow::Result<()> {
         inbox,
         Arc::new(Mutex::new(None)),
         "umbra",
-    );
+    ).await;
     let port = spawn_api(state).await?;
     let resp = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{port}/status"))
@@ -704,7 +807,7 @@ async fn pair_code_arms_a_single_use_code() -> anyhow::Result<()> {
         Arc::new(PokeInbox::new(512)),
         Arc::new(Mutex::new(None)),
         "umbra",
-    );
+    ).await;
     let port = spawn_api(state.clone()).await?;
     let resp = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/pair/code"))
@@ -742,7 +845,7 @@ async fn pair_refuses_revoked_peer_with_conflict() -> anyhow::Result<()> {
         Arc::new(PokeInbox::new(512)),
         Arc::new(Mutex::new(None)),
         "umbra",
-    );
+    ).await;
     let port = spawn_api(state).await?;
     let resp = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/pair"))
@@ -859,6 +962,12 @@ async fn pair_returns_conflict_when_persist_fails() -> anyhow::Result<()> {
     std::fs::write(&blocker, b"not a directory")?;
     let blocked = FileAllowlistStorage::at_path(blocker.join("allowlist.json"));
 
+    // Phase 4 persists through `membership`'s own paths, not `st.allowlist`, so
+    // break the real persist target: a directory where membership.json should
+    // be makes the atomic temp+rename fail (EISDIR/ENOTDIR).
+    let _ = std::fs::remove_file(rhea_dir.join("membership.json"));
+    std::fs::create_dir(rhea_dir.join("membership.json"))?;
+
     let rhea_state = Arc::new(webdesserts_mesh::api::ApiState {
         node: rhea.node.clone(),
         allowlist: Arc::new(blocked),
@@ -872,6 +981,11 @@ async fn pair_returns_conflict_when_persist_fails() -> anyhow::Result<()> {
         pending_pairing: rhea.pending_pairing.clone(),
         notes_health_url: rhea.notes_health_url.clone(),
         relay_listen: rhea.relay_listen,
+        membership: rhea.membership.clone(),
+        registrations: rhea.registrations.clone(),
+        health_client: reqwest::Client::new(),
+        listen_port: rhea.listen_port,
+        relay_port: rhea.relay_port,
     });
 
     let umbra_port = spawn_api(umbra.api_state()).await?;

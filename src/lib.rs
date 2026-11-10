@@ -8,8 +8,11 @@
 
 pub mod api;
 pub mod config;
+pub mod membership_store;
+pub mod membership_sync;
 pub mod poke;
 pub mod proxy;
+pub mod register;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -25,6 +28,10 @@ use p2p_core::daemon_lock::DaemonLock;
 use p2p_core::gossip::{GossipEvent, GossipHandle};
 use p2p_core::identity::IdentityKey;
 use p2p_core::node::P2pNode;
+
+use crate::membership_store::MembershipStore;
+use crate::membership_sync::{ALPN_MEMBERSHIP, MembershipSyncHandler, MeshWireMessage};
+use crate::register::RegistrationStore;
 use p2p_core::relay::EmbeddedRelay;
 use p2p_core::relay_addr::RelayAddr;
 use tokio::sync::Mutex;
@@ -104,6 +111,14 @@ pub struct MeshDaemon {
     pub notes_health_url: String,
     /// Whether this daemon started an embedded relay (`relay_listen = true`).
     pub relay_listen: bool,
+    /// Signed membership log: the sole writer of `allowlist.json`.
+    pub membership: Arc<MembershipStore>,
+    /// Dynamically registered apps + admin token.
+    pub registrations: Arc<RegistrationStore>,
+    /// Loopback API port (reserved from dynamic app registration).
+    pub listen_port: u16,
+    /// Embedded relay port (reserved from dynamic app registration).
+    pub relay_port: u16,
     /// Embedded relay, held for the Phase 3 cutover. `None` unless
     /// `relay_listen = true` (default false: NotesSync owns `0.0.0.0:3340`).
     _relay: Option<EmbeddedRelay>,
@@ -125,6 +140,36 @@ impl MeshDaemon {
         let self_id = identity.peer_id();
 
         let allowlist = Arc::new(FileAllowlistStorage::at_path(&paths.allowlist));
+
+        // The signed membership log is the source of truth; `allowlist.json` is
+        // only ever a projection of it (single-writer invariant, B4).
+        let membership = Arc::new(
+            MembershipStore::load_or_init(
+                Arc::new(identity.clone()),
+                paths.clone(),
+                allowlist.clone(),
+                cfg.device_name.clone(),
+            )
+            .await
+            .context("load or initialize membership log")?,
+        );
+        let registrations = Arc::new(
+            RegistrationStore::load_or_init(paths.clone())
+                .await
+                .context("load app registrations")?,
+        );
+        let listen_port: u16 = cfg
+            .listen_addr
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse().ok())
+            .unwrap_or(4620);
+        let relay_port: u16 = cfg
+            .relay_bind
+            .as_deref()
+            .unwrap_or(crate::config::DEFAULT_RELAY_BIND)
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse().ok())
+            .unwrap_or(3340);
 
         let relays: Vec<RelayAddr> = cfg
             .known_public_relays
@@ -154,11 +199,18 @@ impl MeshDaemon {
             None
         };
 
-        let handler = MeshHttpProxyHandler::new(allowlist.clone(), apps.clone());
+        let handler = MeshHttpProxyHandler::new(
+            allowlist.clone(),
+            apps.clone(),
+            membership.clone(),
+            registrations.clone(),
+        );
+        let membership_handler = MembershipSyncHandler::new(membership.clone());
 
         let mut node = P2pNode::builder(identity.secret_key_bytes(), &relays, allowlist.clone())
             .mdns_service_name(MDNS_SERVICE_NAME)
             .with_protocol(HTTP_PROXY_ALPN, handler)
+            .with_protocol(ALPN_MEMBERSHIP, membership_handler)
             .build()
             .await
             .context("build p2p node")?;
@@ -195,6 +247,7 @@ impl MeshDaemon {
             let pending_pairing = pending_pairing.clone();
             let relays = relays.clone();
             let device_name = device_name.clone();
+            let membership = membership.clone();
             tokio::spawn(async move {
                 while let Some(ev) = inbound_pairing_rx.recv().await {
                     match ev {
@@ -238,13 +291,12 @@ impl MeshDaemon {
                             let _ = exchange.reply_tx.send(approval);
                         }
                         PairingEvent::PairingCompleted { peer_id, device_name: peer_name } => {
-                            match add_or_update_peer_unique(&allowlist, peer_id, &peer_name).await {
-                                Ok(name) => tracing::info!(peer = %peer_id, name = %name, "inbound mesh pairing completed"),
-                                Err(e) => {
-                                    tracing::warn!(peer = %peer_id, error = %e, "persist inbound paired peer failed");
-                                    continue;
-                                }
-                            }
+                            // S1a: PAKE succeeded, but nothing is written to
+                            // `allowlist.json` yet. Record an in-memory pending
+                            // grant so the joiner'"'"'s immediate ALPN_MEMBERSHIP
+                            // stream passes the gate; the signed Add lands there.
+                            membership.grant_pending(peer_id, peer_name.clone()).await;
+                            tracing::info!(peer = %peer_id, name = %peer_name, "inbound mesh pairing completed (pending membership grant)");
                             for relay in &relays {
                                 node.add_peer_relay(peer_id, relay);
                             }
@@ -277,9 +329,43 @@ impl MeshDaemon {
             pending_pairing,
             notes_health_url,
             relay_listen,
+            membership,
+            registrations,
+            listen_port,
+            relay_port,
             _relay: relay,
             _lock: lock,
         })
+    }
+
+    /// Revocation teardown (S3) for the gossip loop: drop pooled connections,
+    /// evict relay hints, and re-join gossip with only the active peers.
+    async fn teardown_revoked_peers(
+        pool: &ConnPool,
+        node: &P2pNode,
+        gossip: &Arc<Mutex<Option<GossipHandle>>>,
+        membership: &MembershipStore,
+        revoked: &[PeerId],
+    ) {
+        if revoked.is_empty() {
+            return;
+        }
+        {
+            let mut p = pool.lock().await;
+            for peer in revoked {
+                p.remove(peer);
+            }
+        }
+        for peer in revoked {
+            node.remove_peer_relay(*peer);
+        }
+        let active = membership.active_peer_ids().await;
+        let guard = gossip.lock().await;
+        if let Some(h) = guard.as_ref() {
+            if let Err(e) = h.rejoin_peers(active).await {
+                tracing::warn!(error = %e, "gossip rejoin after revocation failed");
+            }
+        }
     }
 
     /// Join the poke gossip topic and pump received pokes into the inbox.
@@ -308,29 +394,129 @@ impl MeshDaemon {
 
         let inbox = self.inbox.clone();
         let allowlist = self.allowlist.clone();
+        let membership = self.membership.clone();
+        let node = self.node.clone();
+        let pool = self.pool.clone();
+        let gossip = self.gossip.clone();
         tokio::spawn(async move {
             while let Some(ev) = sub.recv().await {
                 match ev {
-                    GossipEvent::Data { bytes, .. } => {
-                        let Ok(wire) = serde_json::from_slice::<MeshPokeWire>(&bytes) else {
-                            continue;
-                        };
-                        let from_device = match wire.sender_peer_id.parse::<PeerId>() {
-                            Ok(peer) => allowlist
-                                .list_peers()
-                                .await
+                    GossipEvent::Data { bytes, from } => {
+                        // Compact frames first, then a bare poke for compatibility.
+                        let parsed = match serde_json::from_slice::<MeshWireMessage>(&bytes) {
+                            Ok(msg) => Some(msg),
+                            Err(_) => serde_json::from_slice::<MeshPokeWire>(&bytes)
                                 .ok()
-                                .and_then(|peers| {
-                                    peers
-                                        .into_iter()
-                                        .find(|p| p.node_id == peer && !p.removed)
-                                        .map(|p| p.device_name)
-                                }),
-                            Err(_) => None,
+                                .map(MeshWireMessage::Poke),
                         };
-                        inbox.push(wire, from_device);
+                        let Some(msg) = parsed else { continue };
+                        match msg {
+                            MeshWireMessage::Poke(wire) => {
+                                let from_device = match wire.sender_peer_id.parse::<PeerId>() {
+                                    Ok(peer) => allowlist
+                                        .list_peers()
+                                        .await
+                                        .ok()
+                                        .and_then(|peers| {
+                                            peers
+                                                .into_iter()
+                                                .find(|p| p.node_id == peer && !p.removed)
+                                                .map(|p| p.device_name)
+                                        }),
+                                    Err(_) => None,
+                                };
+                                inbox.push(wire, from_device);
+                            }
+                            MeshWireMessage::Membership(entry) => {
+                                // Fast path: merge only when every parent is known.
+                                let log = membership.log_snapshot().await;
+                                let known = entry
+                                    .parent_heads()
+                                    .iter()
+                                    .all(|h| log.entries.contains_key(h));
+                                if known && entry.mesh_id() == log.mesh_id {
+                                    match membership
+                                        .merge_entries(std::slice::from_ref(&entry))
+                                        .await
+                                    {
+                                        Ok(revoked) => {
+                                            Self::teardown_revoked_peers(
+                                                &pool, &node, &gossip, &membership, &revoked,
+                                            )
+                                            .await;
+                                        }
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            "merge gossiped membership entry failed"
+                                        ),
+                                    }
+                                } else {
+                                    match crate::membership_sync::pull_anti_entropy(
+                                        &node, from, &membership,
+                                    )
+                                    .await
+                                    {
+                                        Ok(revoked) => {
+                                            Self::teardown_revoked_peers(
+                                                &pool, &node, &gossip, &membership, &revoked,
+                                            )
+                                            .await;
+                                        }
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            "anti-entropy pull after gossip failed"
+                                        ),
+                                    }
+                                }
+                            }
+                            MeshWireMessage::AntiEntropy { mesh_id, heads } => {
+                                let log = membership.log_snapshot().await;
+                                let missing = mesh_id != log.mesh_id
+                                    || heads.iter().any(|h| !log.entries.contains_key(h));
+                                if missing {
+                                    match crate::membership_sync::pull_anti_entropy(
+                                        &node, from, &membership,
+                                    )
+                                    .await
+                                    {
+                                        Ok(revoked) => {
+                                            Self::teardown_revoked_peers(
+                                                &pool, &node, &gossip, &membership, &revoked,
+                                            )
+                                            .await;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "anti-entropy pull failed")
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
-                    GossipEvent::NeighborUp(_) | GossipEvent::NeighborDown(_) => {}
+                    GossipEvent::NeighborUp(peer) => {
+                        // A device that was offline during an Add/Remove catches up
+                        // immediately on reconnect.
+                        if membership.is_active(&peer).await {
+                            match crate::membership_sync::pull_anti_entropy(
+                                &node, peer, &membership,
+                            )
+                            .await
+                            {
+                                Ok(revoked) => {
+                                    Self::teardown_revoked_peers(
+                                        &pool, &node, &gossip, &membership, &revoked,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => tracing::warn!(
+                                    peer = %peer,
+                                    error = %e,
+                                    "anti-entropy pull on NeighborUp failed"
+                                ),
+                            }
+                        }
+                    }
+                    GossipEvent::NeighborDown(_) => {}
                     GossipEvent::Lagged => {}
                 }
             }
@@ -355,6 +541,14 @@ impl MeshDaemon {
             pending_pairing: self.pending_pairing.clone(),
             notes_health_url: self.notes_health_url.clone(),
             relay_listen: self.relay_listen,
+            membership: self.membership.clone(),
+            registrations: self.registrations.clone(),
+            health_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(500))
+                .build()
+                .unwrap_or_default(),
+            listen_port: self.listen_port,
+            relay_port: self.relay_port,
         })
     }
 

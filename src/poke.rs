@@ -125,7 +125,9 @@ impl PokeInbox {
         }
         q.push_back(stored);
         drop(q);
-        let _ = self.tx.send(seq);
+        // `send` does not update the stored value when there are zero
+        // receivers; `send_replace` always does, so `latest_seq()` stays honest.
+        self.tx.send_replace(seq);
         seq
     }
 
