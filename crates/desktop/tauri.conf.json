@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Mesh",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "identifier": "com.webdesserts.mesh",
   "build": {
     "frontendDist": "ui"
@@ -23,7 +23,8 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "targets": ["app", "dmg"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

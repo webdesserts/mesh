@@ -43,10 +43,10 @@ enum Cmd {
     },
 }
 
-fn paths(dir: Option<String>) -> MeshPaths {
+fn paths(dir: Option<String>) -> Result<MeshPaths> {
     match dir {
-        Some(d) => MeshPaths::at(d),
-        None => MeshPaths::default_paths(),
+        Some(d) => Ok(MeshPaths::at(d)),
+        None => MeshPaths::resolve(),
     }
 }
 
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Daemon { dir } => {
-            let paths = paths(dir);
+            let paths = paths(dir)?;
             paths.ensure_dir()?;
             let cfg = if paths.config.exists() {
                 paths.load_config()?
@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
             peer_device_name,
             dir,
         } => {
-            let paths = paths(dir);
+            let paths = paths(dir)?;
             let base = api_base(&paths);
             let body = serde_json::json!({
                 "peer": peer,
@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Status { dir } => {
-            let paths = paths(dir);
+            let paths = paths(dir)?;
             let base = api_base(&paths);
             let resp = reqwest::Client::new()
                 .get(format!("{base}/status"))

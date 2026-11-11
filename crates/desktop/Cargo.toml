@@ -1,12 +1,8 @@
 [package]
 name = "mesh-desktop"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Mesh.app — macOS menu-bar tray app hosting the webdesserts-mesh daemon"
-
-# Exclude from cargo-dist builds — this crate uses Tauri's own bundling pipeline.
-[package.metadata.dist]
-dist = false
 
 [[bin]]
 name = "Mesh"
@@ -18,6 +14,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 webdesserts-mesh = { path = "../.." }
 p2p-core = { git = "https://github.com/webdesserts/p2p-core.git", tag = "v0.1.6" }
+app-config = { git = "https://github.com/webdesserts/app-config.git", tag = "v0.1.0" }
 tauri = { version = "2", features = ["tray-icon", "image-png", "wry"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-updater = "2"

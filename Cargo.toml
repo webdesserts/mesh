@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "webdesserts-mesh"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 repository = "https://github.com/webdesserts/mesh"
 description = "Peer-to-peer mesh daemon and relay for WebDesserts devices"
@@ -20,6 +20,7 @@ data-encoding = "2"
 sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+app-config = { git = "https://github.com/webdesserts/app-config.git", tag = "v0.1.0" }
 futures = "0.3"
 iroh = { version = "1.4.1", default-features = false, features = ["tls-ring", "default", "platform-verifier"] }
 rand = "0.9"
@@ -31,9 +32,6 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[profile.dist]
-inherits = "release"
-lto = "thin"
-
 [dev-dependencies]
+tempfile = "3"
 p2p-core = { git = "https://github.com/webdesserts/p2p-core.git", tag = "v0.1.6", features = ["test-util"] }

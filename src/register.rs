@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
-use crate::config::{AppTargetConfig, MeshPaths, write_file_0600};
+use crate::config::{AppTargetConfig, MeshPaths};
 
 /// A dynamically registered app (only the token hash is stored).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,7 +91,7 @@ impl RegistrationStore {
             Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
             _ => {
                 let token = mint_token();
-                write_file_0600(&paths.admin_token, token.as_bytes())
+                app_config::write_secret_atomic(&paths.admin_token, token.as_bytes())
                     .context("write admin.token")?;
                 token
             }
@@ -214,11 +214,8 @@ impl RegistrationStore {
 
     async fn persist(&self, regs: &Registrations) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(regs).context("serialize registrations.json")?;
-        let tmp = self.paths.registrations.with_extension("json.tmp");
-        write_file_0600(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &self.paths.registrations)
-            .with_context(|| format!("rename {}", self.paths.registrations.display()))?;
-        Ok(())
+        app_config::write_secret_atomic(&self.paths.registrations, &bytes)
+            .with_context(|| format!("write {}", self.paths.registrations.display()))
     }
 }
 

@@ -24,7 +24,7 @@ use p2p_core::PeerId;
 use p2p_core::allowlist::{AllowlistStorage, FileAllowlistStorage};
 use p2p_core::pairing::PairingChallenge;
 use p2p_core::pairing_handler::{PairingApproval, PairingEvent};
-use p2p_core::daemon_lock::DaemonLock;
+use p2p_core::daemon_lock::{DaemonLock, LockError};
 use p2p_core::gossip::{GossipEvent, GossipHandle};
 use p2p_core::identity::IdentityKey;
 use p2p_core::node::P2pNode;
@@ -37,6 +37,21 @@ use p2p_core::relay_addr::RelayAddr;
 use tokio::sync::Mutex;
 
 use crate::config::{AppTargetConfig, MeshConfig, MeshPaths};
+
+/// `mesh.lock` is held by another process (a second instance, or a daemon
+/// still starting). Callers detect it with `err.downcast_ref::<MeshLockHeld>()`.
+#[derive(Debug)]
+pub struct MeshLockHeld {
+    pub lock: std::path::PathBuf,
+}
+
+impl std::fmt::Display for MeshLockHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mesh lock {} is held by another process", self.lock.display())
+    }
+}
+
+impl std::error::Error for MeshLockHeld {}
 use crate::poke::{MeshPokeWire, PokeInbox, SharedPokeInbox, poke_topic};
 use crate::proxy::{ConnPool, HTTP_PROXY_ALPN, MeshHttpProxyHandler, new_pool};
 
@@ -102,8 +117,12 @@ impl MeshDaemon {
         cfg.validate()?;
         paths.ensure_dir()?;
 
-        let lock = DaemonLock::acquire_at(&paths.lock)
-            .map_err(|e| anyhow::anyhow!("acquire mesh lock: {e}"))?;
+        let lock = DaemonLock::acquire_at(&paths.lock).map_err(|e| match e {
+            LockError::AlreadyLocked => anyhow::Error::new(MeshLockHeld {
+                lock: paths.lock.clone(),
+            }),
+            other => anyhow::anyhow!("acquire mesh lock: {other}"),
+        })?;
 
         let identity = IdentityKey::load_or_generate_at(&paths.key)
             .await

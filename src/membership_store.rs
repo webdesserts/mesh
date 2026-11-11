@@ -17,7 +17,7 @@ use p2p_core::membership::{
 };
 use tokio::sync::RwLock;
 
-use crate::config::{MeshPaths, write_file_0600};
+use crate::config::MeshPaths;
 
 /// How long a pending membership grant stays valid after a successful PAKE.
 pub const PENDING_GRANT_TTL: Duration = Duration::from_secs(60);
@@ -260,11 +260,8 @@ impl MembershipStore {
     async fn persist(&self) -> Result<()> {
         let log = self.log.read().await.clone();
         let bytes = serde_json::to_vec_pretty(&log).context("serialize membership.json")?;
-        let tmp = self.paths.membership.with_extension("json.tmp");
-        write_file_0600(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &self.paths.membership)
-            .with_context(|| format!("rename {}", self.paths.membership.display()))?;
-        Ok(())
+        app_config::write_secret_atomic(&self.paths.membership, &bytes)
+            .with_context(|| format!("write {}", self.paths.membership.display()))
     }
 
     /// The single writer of `allowlist.json`: a full overwrite from the

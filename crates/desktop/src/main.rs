@@ -22,15 +22,6 @@ use tauri_plugin_autostart::ManagerExt;
 use webdesserts_mesh::api;
 use webdesserts_mesh::config::{MeshConfig, MeshPaths};
 
-/// Resolve the mesh data directory: `MESH_DIR` override, else the default
-/// `~/.config/webdesserts/mesh`.
-fn resolve_paths() -> MeshPaths {
-    match std::env::var("MESH_DIR") {
-        Ok(dir) if !dir.trim().is_empty() => MeshPaths::at(dir),
-        _ => MeshPaths::default_paths(),
-    }
-}
-
 /// Detect the local machine name for a first-run `config.toml`.
 ///
 /// Order: `MESH_DEVICE_NAME`, `scutil --get LocalHostName`, `hostname`, `"mac"`.
@@ -88,7 +79,8 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let paths = resolve_paths();
+    // `MESH_DIR` override, else `~/.config/mesh` (migrating legacy dirs first).
+    let paths = MeshPaths::resolve()?;
     let cfg = ensure_default_config(&paths)?;
 
     tauri::Builder::default()
@@ -129,7 +121,17 @@ fn main() -> Result<()> {
                 let host = DaemonHost::start(start_paths, start_cfg, control_router).await?;
                 let token = api_client::read_admin_token(&token_path).ok();
                 Ok::<_, anyhow::Error>((host, token))
-            })?;
+            });
+            // Another instance holds `mesh.lock` but its API is not up yet:
+            // exit 0 so launchd (`KeepAlive.SuccessfulExit = false`) does not
+            // respawn us in a loop.
+            let host = match host {
+                Err(e) if e.downcast_ref::<webdesserts_mesh::MeshLockHeld>().is_some() => {
+                    tracing::warn!(error = %e, "another Mesh instance holds the lock; exiting 0");
+                    std::process::exit(0);
+                }
+                other => other?,
+            };
             let (host, token) = host;
             let client = api_client::Client::new(base, token);
 
@@ -225,10 +227,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_paths_honors_mesh_dir() {
+    fn resolve_honors_mesh_dir() {
         // SAFETY: single-threaded test process; restored immediately.
         unsafe { std::env::set_var("MESH_DIR", "/tmp/mesh-dir-test") };
-        let paths = resolve_paths();
+        let paths = MeshPaths::resolve().unwrap();
         unsafe { std::env::remove_var("MESH_DIR") };
         assert_eq!(paths.dir, std::path::PathBuf::from("/tmp/mesh-dir-test"));
         assert_eq!(paths.config, std::path::PathBuf::from("/tmp/mesh-dir-test/config.toml"));
