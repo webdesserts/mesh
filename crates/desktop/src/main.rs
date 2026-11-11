@@ -72,6 +72,12 @@ fn ensure_default_config(paths: &MeshPaths) -> Result<MeshConfig> {
 }
 
 fn main() -> Result<()> {
+    // Cask `binary` symlink (`webdesserts-mesh` -> Mesh.app/Contents/MacOS/Mesh):
+    // route to the shared CLI before Tauri starts. Only argv[0] is inspected.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if webdesserts_mesh::cli::should_dispatch_cli(&args) {
+        return webdesserts_mesh::cli::run_from_os_args(args);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

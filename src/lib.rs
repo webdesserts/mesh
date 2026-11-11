@@ -7,6 +7,7 @@
 //! `p2p-core`'"'"'s once-per-connection `AllowlistProtocolHandler`.
 
 pub mod api;
+pub mod cli;
 pub mod config;
 pub mod membership_store;
 pub mod membership_sync;
