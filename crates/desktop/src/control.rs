@@ -46,7 +46,7 @@ async fn app_restart(State(app): State<AppHandle>) -> Response {
         // Let the HTTP response flush before the process restarts.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         shutdown::shutdown_host(&app).await;
-        app.restart();
+        crate::launch_agent::relaunch_app(&app);
     });
     Json(json!({ "ok": true, "restarting": true })).into_response()
 }
@@ -109,7 +109,7 @@ async fn app_update(State(app): State<AppHandle>) -> Response {
             return;
         }
         shutdown::shutdown_host(&app).await;
-        app.restart();
+        crate::launch_agent::relaunch_app(&app);
     });
     Json(json!({ "ok": true, "updating": true })).into_response()
 }

@@ -7,7 +7,6 @@ use crate::state::AppState;
 use tauri::menu::{CheckMenuItemBuilder, IsMenuItem, Menu, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry};
-use tauri_plugin_autostart::ManagerExt;
 
 /// Tray id used by `app.tray_by_id`.
 pub const TRAY_ID: &str = "main";
@@ -160,9 +159,8 @@ fn menu_for(
         .build(app)?;
     let restart_item = MenuItemBuilder::with_id("restart_daemon", "Restart Daemon").build(app)?;
     let updates_item = MenuItemBuilder::with_id("check_updates", "Check for Updates…").build(app)?;
-    let autostart_on = app
-        .autolaunch()
-        .is_enabled()
+    let autostart_on = crate::launch_agent::LaunchAgent::for_user()
+        .map(|agent| agent.is_enabled())
         .unwrap_or(false);
     let autostart_item = CheckMenuItemBuilder::with_id("toggle_autostart", "Launch at Login")
         .checked(autostart_on)

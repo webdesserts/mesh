@@ -5,6 +5,7 @@ mod api_client;
 mod commands;
 mod control;
 mod daemon_host;
+mod launch_agent;
 mod menu_events;
 mod pair_window;
 mod shutdown;
@@ -18,8 +19,6 @@ use state::AppState;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::Manager;
-use tauri_plugin_autostart::ManagerExt;
-use webdesserts_mesh::api;
 use webdesserts_mesh::config::{MeshConfig, MeshPaths};
 
 /// Detect the local machine name for a first-run `config.toml`.
@@ -87,13 +86,11 @@ fn main() -> Result<()> {
 
     // `MESH_DIR` override, else `~/.config/mesh` (migrating legacy dirs first).
     let paths = MeshPaths::resolve()?;
-    let cfg = ensure_default_config(&paths)?;
+    let mut cfg = ensure_default_config(&paths)?;
+    // Launch at Login: reconcile ~/Library/LaunchAgents with `autostart_enabled`.
+    launch_agent::reconcile(&paths, &mut cfg);
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::daemon_snapshot,
@@ -106,11 +103,6 @@ fn main() -> Result<()> {
             // Menu-bar only: no Dock icon, no app switcher entry.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-
-            // Launch at Login: enable on first run, then report the live state
-            // through `GET /status` (`autostart_enabled`).
-            let _ = app.autolaunch().enable();
-            api::set_autostart_enabled(app.autolaunch().is_enabled().ok());
 
             let handle = app.handle().clone();
             let paths = paths.clone();

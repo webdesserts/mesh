@@ -1,7 +1,6 @@
 //! Tray menu event dispatch.
 
 use tauri::AppHandle;
-use tauri_plugin_autostart::ManagerExt;
 
 pub fn handle(app: &AppHandle, id: &str) {
     match id {
@@ -42,23 +41,12 @@ pub fn handle(app: &AppHandle, id: &str) {
             });
         }
         "toggle_autostart" => {
-            let autolaunch = app.autolaunch();
-            let enabled = autolaunch.is_enabled().unwrap_or(false);
-            let result = if enabled {
-                autolaunch.disable()
-            } else {
-                autolaunch.enable()
-            };
-            match result {
-                Ok(()) => {
-                    let now = autolaunch.is_enabled().ok();
-                    webdesserts_mesh::api::set_autostart_enabled(now);
-                    tracing::info!(enabled = ?now, "launch at login toggled");
-                }
-                Err(e) => tracing::warn!(error = %e, "launch at login toggle failed"),
-            }
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
+                match crate::launch_agent::toggle(&app).await {
+                    Ok(enabled) => tracing::info!(enabled, "launch at login toggled"),
+                    Err(e) => tracing::warn!(error = %e, "launch at login toggle failed"),
+                }
                 crate::tray::refresh(&app).await;
             });
         }
