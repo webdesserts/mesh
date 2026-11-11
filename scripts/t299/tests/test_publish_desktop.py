@@ -68,6 +68,7 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(env['APPLE_SIGNING_IDENTITY'], 'ObsidianMemory Dev Signing')
             self.assertEqual(env['TAURI_SIGNING_PRIVATE_KEY'], str(self.key))
             self.assertIn('TAURI_SIGNING_PRIVATE_KEY_PASSWORD', env)
+            self.assertEqual(env['CI'], 'true')
             self.assertEqual(argv[:7], ['cargo', 'tauri', 'build', '--target', 'universal-apple-darwin', '--bundles', 'app,dmg'])
             dmg, tar_gz, _ = self.built()
             for path in [dmg, tar_gz]:

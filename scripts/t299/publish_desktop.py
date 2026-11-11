@@ -111,10 +111,12 @@ def build_and_validate(source, tag, config_path, runner, validator, updater_key=
     for path in [dmg, tar_gz, sig, latest]:
         require(not path.exists() and not path.is_symlink(), 'final artifact already exists; use a fresh build checkout')
     key = resolve_updater_key(updater_key)
-    # An explicit (possibly empty) password keeps tauri-cli from prompting on stdin when CI is unset.
+    # An explicit (possibly empty) password keeps tauri-cli from prompting on stdin; CI='true' makes
+    # bundle_dmg.sh pass --skip-jenkins so no Finder window opens during the build.
     signing_env = dict(env, APPLE_SIGNING_IDENTITY=SIGNING_IDENTITY, CARGO_TARGET_DIR=str(source / 'target'),
                        TAURI_SIGNING_PRIVATE_KEY=str(key),
-                       TAURI_SIGNING_PRIVATE_KEY_PASSWORD=os.environ.get('TAURI_SIGNING_PRIVATE_KEY_PASSWORD', ''))
+                       TAURI_SIGNING_PRIVATE_KEY_PASSWORD=os.environ.get('TAURI_SIGNING_PRIVATE_KEY_PASSWORD', ''),
+                       CI='true')
     # Avoid Tauri's shell hook and duplicate frontend builds in historical checkouts.
     with tempfile.TemporaryDirectory(prefix='mesh-tauri-config-') as temp:
         override = Path(temp) / 'tauri-override.json'
