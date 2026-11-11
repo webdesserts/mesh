@@ -64,7 +64,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("'--operation', 'publish', '--run-id', os.environ['GITHUB_RUN_ID']", self.publish)
         self.assertIn("'--signer-config', 'tooling/scripts/t299/signer_config.json'", self.publish)
         self.assertNotIn("'--signer-config'", self.verify)
-        self.assertIn('prevent NEW release OR desktop publication runs until this job completes', self.publish)
+        self.assertIn('prevent NEW desktop publication runs until this job completes', self.publish)
         self.assertNotIn('concurrency:', self.cask)
 
     def test_read_only_test_workflow_covers_new_workflow_and_suite(self):
@@ -72,10 +72,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("'-s', 'scripts/t299/tests', '-v'", self.tests)
         self.assertNotIn('secrets.', self.tests)
         self.assertNotIn('contents: write', self.tests)
-        release = (ROOT / '.github/workflows/release.yml').read_text()
-        self.assertNotIn('build-desktop-dmg', release)
-        self.assertIn('  publish-homebrew-formula:', release)
-        self.assertNotIn('desktop-cask.yml', release)
+        # cargo-dist release.yml is retired: Mesh.app ships only via the cask.
+        self.assertFalse((ROOT / '.github/workflows/release.yml').exists())
+        self.assertNotIn('release.yml', self.tests)
 
 
 if __name__ == '__main__':

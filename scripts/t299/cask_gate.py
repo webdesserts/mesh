@@ -269,7 +269,7 @@ def _validate_fetched_artifact(cache, tag, sha256, signer_config, validator, run
 
 def check_queue(run_id, runner=run):
     require(isinstance(run_id, str) and re.fullmatch('[1-9][0-9]*', run_id), 'current GitHub run ID required')
-    for workflow in ('release.yml', 'desktop-cask.yml'):
+    for workflow in ('desktop-cask.yml',):
         for status in NONTERMINAL:
             endpoint = 'repos/{}/actions/workflows/{}/runs?status={}&per_page=100'.format(REPOSITORY, workflow, status)
             raw = checked(runner, ['gh', 'api', '--paginate', '--slurp', endpoint])

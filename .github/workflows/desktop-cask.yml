@@ -107,7 +107,7 @@ jobs:
           path: tooling
           persist-credentials: false
       # Defensive query, not an atomic lock or FIFO guarantee. The owner must
-      # prevent NEW release OR desktop publication runs until this job completes.
+      # prevent NEW desktop publication runs until this job completes.
       # Broader automatic publication remains disabled and out of scope.
       - name: Refuse other nonterminal writers before tap checkout
         env:

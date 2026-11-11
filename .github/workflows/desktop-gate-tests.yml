@@ -5,13 +5,11 @@ on:
     paths:
       - 'scripts/t299/**'
       - '.github/workflows/desktop-gate-tests.yml'
-      - '.github/workflows/release.yml'
       - '.github/workflows/desktop-cask.yml'
   push:
     paths:
       - 'scripts/t299/**'
       - '.github/workflows/desktop-gate-tests.yml'
-      - '.github/workflows/release.yml'
       - '.github/workflows/desktop-cask.yml'
 
 permissions:
@@ -44,7 +42,7 @@ jobs:
               'go', 'install',
               'github.com/rhysd/actionlint/cmd/actionlint@v1.7.7',
           ], check=True)
-      - name: Lint gate and existing release workflows
+      - name: Lint gate and desktop cask workflows
         shell: python {0}
         run: |
           from pathlib import Path
@@ -52,6 +50,5 @@ jobs:
           subprocess.run([
               str(Path.home() / 'go/bin/actionlint'),
               '.github/workflows/desktop-gate-tests.yml',
-              '.github/workflows/release.yml',
               '.github/workflows/desktop-cask.yml',
           ], check=True)

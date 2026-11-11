@@ -677,7 +677,8 @@ class AuditQueueTests(unittest.TestCase):
             rows = [{'id': 123, 'status': status}]
             return subprocess.CompletedProcess(argv, 0, json.dumps([{'total_count': 1, 'workflow_runs': rows}]), '')
         gate.check_queue('123', runner=runner)
-        self.assertEqual(len(calls), 2 * len(gate.NONTERMINAL))
+        # Only desktop-cask.yml is queued now (cargo-dist release.yml retired).
+        self.assertEqual(len(calls), len(gate.NONTERMINAL))
         for state in gate.NONTERMINAL:
             def active(argv, **kw):
                 status = argv[-1].split('status=')[1].split('&')[0]
