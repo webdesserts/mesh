@@ -73,14 +73,29 @@ def generate(tag, sha256, macos_floor):
     strategy :github_latest
   end
 
+  auto_updates true
   depends_on macos: :{floor}
 
   app "Mesh.app"
+  binary "#{{appdir}}/Mesh.app/Contents/MacOS/Mesh", target: "webdesserts-mesh"
+
+  postflight_steps do
+    run "/usr/bin/xattr",
+        args:         ["-dr", "com.apple.provenance", "{{{{appdir}}}}/Mesh.app"],
+        must_succeed: false,
+        print_stderr: false
+    run "/usr/bin/xattr",
+        args:         ["-dr", "com.apple.quarantine", "{{{{appdir}}}}/Mesh.app"],
+        must_succeed: false,
+        print_stderr: false
+  end
 
   caveats <<~EOS
-    Mesh is self-signed, not Apple-notarized. On first launch, macOS may block it.
-    After verifying the release, approve it once in System Settings > Privacy & Security > Open Anyway.
-    Never approve an unexpected warning. An upgrade may require approval again.
+    Mesh is self-signed, not Apple-notarized. Homebrew clears com.apple.provenance
+    and quarantine in postflight_steps so the bundle does not stall at launch. If
+    macOS still prompts on first launch, verify the release and approve it once in
+    System Settings > Privacy & Security > Open Anyway.
+    Never approve an unexpected warning.
     The macOS floor is a reviewed support policy, not proof on every newer macOS release.
   EOS
 end

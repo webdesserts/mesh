@@ -141,12 +141,26 @@ class CandidateTests(unittest.TestCase):
                     '    url :url\n'
                     '    strategy :github_latest\n'
                     '  end\n\n'
-                                        '  depends_on macos: :sonoma\n\n'
-                    '  app "Mesh.app"\n\n'
+                    '  auto_updates true\n'
+                    '  depends_on macos: :sonoma\n\n'
+                    '  app "Mesh.app"\n'
+                    '  binary "#{appdir}/Mesh.app/Contents/MacOS/Mesh", target: "webdesserts-mesh"\n\n'
+                    '  postflight_steps do\n'
+                    '    run "/usr/bin/xattr",\n'
+                    '        args:         ["-dr", "com.apple.provenance", "{{appdir}}/Mesh.app"],\n'
+                    '        must_succeed: false,\n'
+                    '        print_stderr: false\n'
+                    '    run "/usr/bin/xattr",\n'
+                    '        args:         ["-dr", "com.apple.quarantine", "{{appdir}}/Mesh.app"],\n'
+                    '        must_succeed: false,\n'
+                    '        print_stderr: false\n'
+                    '  end\n\n'
                     '  caveats <<~EOS\n'
-                    '    Mesh is self-signed, not Apple-notarized. On first launch, macOS may block it.\n'
-                    '    After verifying the release, approve it once in System Settings > Privacy & Security > Open Anyway.\n'
-                    '    Never approve an unexpected warning. An upgrade may require approval again.\n'
+                    '    Mesh is self-signed, not Apple-notarized. Homebrew clears com.apple.provenance\n'
+                    '    and quarantine in postflight_steps so the bundle does not stall at launch. If\n'
+                    '    macOS still prompts on first launch, verify the release and approve it once in\n'
+                    '    System Settings > Privacy & Security > Open Anyway.\n'
+                    '    Never approve an unexpected warning.\n'
                     '    The macOS floor is a reviewed support policy, not proof on every newer macOS release.\n'
                     '  EOS\n'
                     'end\n')
@@ -157,8 +171,12 @@ class CandidateTests(unittest.TestCase):
         for tag, sha, floor in [('v0.5.8', self.sha, ''), ('v0.5.8', self.sha, 'invented'), ('v0.5.8', 'bad', 'sonoma'), ('latest', self.sha, 'sonoma')]:
             with self.subTest(tag=tag, sha=sha, floor=floor), self.assertRaises(gate.ValidationError):
                 gate.generate(tag, sha, floor)
-        for forbidden in ['no-quarantine', 'xattr', 'postflight', 'no_check', 'spctl']:
+        for forbidden in ['no-quarantine', 'no_check', 'spctl', 'sudo', 'rm -']:
             self.assertNotIn(forbidden, expected)
+        # Updater-owned upgrades, CLI symlink and non-fatal provenance/quarantine clearing.
+        self.assertIn('  auto_updates true\n', expected)
+        self.assertIn('target: "webdesserts-mesh"', expected)
+        self.assertEqual(expected.count('must_succeed: false'), 2)
 
     def test_candidate_resolution_accepts_relative_and_absolute_source_paths(self):
         self.assertEqual(self.validate()['status'], 'validated')
